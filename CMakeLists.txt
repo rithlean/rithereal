@@ -17,6 +17,9 @@ add_library(rith_core
   src/sim.cpp
   src/bench.cpp
   src/verilog.cpp
+  src/design.cpp
+  src/scan.cpp
+  src/scan_out.cpp
   src/file_io.cpp
   src/liberty.cpp
   src/fault.cpp

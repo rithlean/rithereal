@@ -11,76 +11,13 @@
 
 #include "rith/io.hpp"
 #include "rith/sim.hpp"
+#include "libfunc.hpp"
 
 namespace rith {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Boolean functions of Liberty cells, evaluated by truth table
-// ---------------------------------------------------------------------------
-constexpr const char* kState = "@IQ";  // the flop's state, shared name across cells
-
-using Env = std::map<std::string, bool>;
-
-bool eval(const LibExpr& e, const LibFlop* ff, const Env& env) {
-  switch (e.op) {
-    case LibExpr::Op::Const0: return false;
-    case LibExpr::Op::Const1: return true;
-    case LibExpr::Op::Var: {
-      if (ff && e.var == ff->iq) return env.at(kState);
-      if (ff && !ff->iqn.empty() && e.var == ff->iqn) return !env.at(kState);
-      auto it = env.find(e.var);
-      if (it == env.end()) throw std::runtime_error("unknown variable '" + e.var + "'");
-      return it->second;
-    }
-    case LibExpr::Op::Not: return !eval(e.args[0], ff, env);
-    case LibExpr::Op::And:
-      for (const auto& a : e.args)
-        if (!eval(a, ff, env)) return false;
-      return true;
-    case LibExpr::Op::Or:
-      for (const auto& a : e.args)
-        if (eval(a, ff, env)) return true;
-      return false;
-    case LibExpr::Op::Xor: {
-      bool v = false;
-      for (const auto& a : e.args) v ^= eval(a, ff, env);
-      return v;
-    }
-  }
-  return false;
-}
-
-// Calls f for every assignment of vars (fixed entries of base are kept).
-template <class F>
-bool for_all(const std::vector<std::string>& vars, Env base, F&& f) {
-  const std::size_t n = vars.size();
-  if (n > 16) return false;  // too many inputs to enumerate; treat as "no match"
-  for (std::uint32_t m = 0; m < (1u << n); ++m) {
-    for (std::size_t k = 0; k < n; ++k) base[vars[k]] = (m >> k) & 1u;
-    if (!f(base)) return false;
-  }
-  return true;
-}
-
-std::vector<std::string> input_pins(const LibCell& c) {
-  std::vector<std::string> v;
-  for (const auto& p : c.pins)
-    if (p.dir == LibPin::Dir::Input) v.push_back(p.name);
-  return v;
-}
-
-std::optional<LibExpr> parse_opt(const std::string& s) {
-  if (s.empty()) return std::nullopt;
-  try { return parse_liberty_function(s); }
-  catch (const std::exception&) { return std::nullopt; }
-}
-
-std::string upper(std::string s) {
-  for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  return s;
-}
+using namespace libfunc;
 
 std::size_t edit_distance(const std::string& a, const std::string& b) {
   std::vector<std::size_t> prev(b.size() + 1), cur(b.size() + 1);

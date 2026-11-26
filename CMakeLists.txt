@@ -20,6 +20,7 @@ add_library(rith_core
   src/design.cpp
   src/scan.cpp
   src/scan_out.cpp
+  src/tpi.cpp
   src/file_io.cpp
   src/liberty.cpp
   src/fault.cpp

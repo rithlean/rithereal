@@ -4,9 +4,10 @@ Open-source design-for-test (DFT) tools in C++: scan insertion, ML-guided test p
 insertion, fault simulation and ATPG for gate-level netlists from Design Compiler,
 Genus or Yosys, with IEEE-standard outputs for Tessent, TestMAX, Modus and OpenROAD.
 
-**Status: Phase 2 (scan insertion).** The netlist core, readers and writers, a
-multi-threaded stuck-at fault simulator, SCOAP/COP testability analysis and mux-D scan
-insertion on library-mapped netlists work today. ML-guided test point insertion is next.
+**Status: Phase 3a (classic test point insertion).** The netlist core, readers and
+writers, a multi-threaded stuck-at fault simulator, SCOAP/COP testability analysis, mux-D
+scan insertion and test point insertion on library-mapped netlists work today. The
+ML-guided test point selector (Phase 3b) is next.
 
 ## Build
 
@@ -64,6 +65,42 @@ build/rith --lib tests/data/tiny.lib scan tests/data/scan_domains.v -o scanned.v
   protocol, a Tessent dofile and test procedure file, and a text report. The STIL and Tessent
   files are untested against the commercial tools so far.
 
+### Test point insertion
+
+```sh
+build/rith tpi design.bench --points 32                 # choose points, report coverage before/after
+build/rith --lib cells.lib tpi mapped.v --points 32 -o tp.v   # insert them with library cells
+build/rith --lib cells.lib scan tp.v -o scanned.v       # then put the new flops on chains
+```
+
+- Three kinds of point: **observe** (a new flop captures the net), **control-0** and
+  **control-1** (the net's consumers see it forced to 0 or 1 when the test enable `tp_en`
+  and the point's own control flop are both 1). Output ports keep the original net, so
+  with `tp_en = 0` the design behaves exactly as before; this is checked by simulation
+  after insertion.
+- Selection is greedy. Each round, candidates are shortlisted by cheap scores, then each
+  is re-scored exactly with a COP pass that includes it. The cost is the expected number of
+  faults still undetected after N random patterns, over logic that some output or flop can
+  see. Every 4 points a fault simulation re-aims the cost at the nets whose faults really
+  escape, since COP alone misjudges reconvergent fanout (`--cop-only` turns this off).
+- Coverage is reported with random patterns over the original logic's uncollapsed faults,
+  so before and after count the same faults.
+- In mapped netlists, control points use AND2/OR2 cells, or NAND2 and INV when the library
+  has no AND2/OR2, and the flops are the library's plain D flop.
+
+On ISCAS benchmarks (4 threads), random-pattern stuck-at coverage with 32,768 patterns, at most 32 points (fewer when another
+point would not help):
+
+| Circuit | Points | Before | After | Selection time |
+|---|---|---|---|---|
+| c2670 | 5 | 84.10% | 96.40% | 0.1 s |
+| c7552 | 20 | 95.54% | 98.84% | 0.4 s |
+| s9234 | 32 | 88.08% | 94.22% | 2.4 s |
+| s13207 | 11 | 97.64% | 98.86% | 0.5 s |
+| s15850 | 32 | 93.51% | 97.44% | 2.0 s |
+| s38417 | 32 | 95.97% | 97.42% | 4.5 s |
+| s38584 | 32 | 94.95% | 97.20% | 3.8 s |
+
 ## What is supported now
 
 | Area | Supported | Not yet |
@@ -76,6 +113,7 @@ build/rith --lib tests/data/tiny.lib scan tests/data/scan_domains.v -o scanned.v
 | Faults | Single stuck-at on stems and fanout branches; equivalence collapsing; faults in unobservable logic counted separately | Transition faults, dominance collapsing |
 | Fault simulation | Parallel-pattern single-fault propagation, event-driven, fault dropping, multi-threaded; checked against brute force | Deterministic ATPG patterns (Phase 4) |
 | Testability | SCOAP CC0/CC1/CO and COP probability/observability, full-scan view | |
+| Test points | Observe, control-0, control-1; greedy COP selection re-aimed by fault simulation; insertion with library cells, mission-mode check | ML-guided selection (Phase 3b), timing-aware placement of points |
 | Scan insertion | Mux-D scan on library cells; function-based scan cell matching; clock-domain and edge grouping; balanced chains; restitching existing scan cells; DEF SCANCHAINS, STIL, Tessent outputs; mission-mode and shift checks | Lockup latches for mixed-clock chains, test-mode control of gated clocks and async set/reset, LSSD and clocked scan, compression |
 
 A 500k-gate netlist parses and levelizes in under a second on one core. Fault simulation of
@@ -84,7 +122,7 @@ a 50k-gate random circuit (133k collapsed faults, 4,096 patterns) takes about 6 
 ## Layout
 
 ```
-include/rith/   public headers (netlist, eval, sim, io, design, liberty, fault, testability, scan)
+include/rith/   public headers (netlist, eval, sim, io, design, liberty, fault, testability, scan, tpi)
 src/            library sources
 tools/          the `rith` command
 tests/          tests and test netlists (ISCAS c17, s27, Yosys-style sample)
@@ -94,8 +132,9 @@ tests/          tests and test netlists (ISCAS c17, s27, Yosys-style sample)
 
 1. **Phase 0, foundations (done):** netlist core, BENCH/Verilog I/O, Liberty cell mapping for DC/Genus netlists.
 2. **Phase 1 (done):** stuck-at fault list, bit-parallel fault simulator, SCOAP/COP.
-3. **Phase 2 (now):** scan insertion and stitching; DEF `SCANCHAINS`, STIL and Tessent outputs.
-4. **Phase 3:** ML-guided test point insertion with a SCOAP/COP fallback. Release v0.1.
+3. **Phase 2 (done):** scan insertion and stitching; DEF `SCANCHAINS`, STIL and Tessent outputs.
+4. **Phase 3:** test point insertion. 3a (now): the classic COP and fault-sim guided baseline.
+   3b: a graph neural network trained on fault-simulation labels, measured against 3a. Release v0.1.
 5. **Phase 4:** PODEM ATPG, compaction, STIL patterns, transition faults. Release v1.0.
 
 ## License

@@ -17,6 +17,7 @@
 #include "rith/scan.hpp"
 #include "rith/sim.hpp"
 #include "rith/testability.hpp"
+#include "rith/tpi.hpp"
 
 namespace {
 
@@ -697,4 +698,119 @@ TEST(scan_outputs) {
   CHECK(dofile.str().find("add_scan_chains chain1 grp1 test_si1 test_so1") != std::string::npos);
   CHECK(proc.str().find("apply shift 3 ;") != std::string::npos);
   CHECK(report.str().find("DFF_X1 -> SDFF_X1") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Test point insertion
+// ---------------------------------------------------------------------------
+namespace {
+
+// A circuit that random patterns struggle with: y = AND of 16 inputs feeds an
+// XOR with more logic behind it, so faults behind the wide AND are rarely seen.
+rith::Netlist hard_netlist() {
+  std::ostringstream b;
+  for (int i = 0; i < 20; ++i) b << "INPUT(i" << i << ")\n";
+  b << "OUTPUT(y)\nOUTPUT(z)\n";
+  b << "a0 = AND(i0, i1, i2, i3)\na1 = AND(i4, i5, i6, i7)\na2 = AND(i8, i9, i10, i11)\n"
+       "a3 = AND(i12, i13, i14, i15)\nw = AND(a0, a1, a2, a3)\n"
+       "x0 = XOR(i16, i17)\nx1 = AND(w, x0)\nx2 = OR(x1, i18)\ny = AND(x2, i19)\n"
+       "z = NOR(a0, a2)\n";
+  return bench_str(b.str());
+}
+
+}  // namespace
+
+TEST(tpi_cop_matches_the_inserted_logic) {
+  // The virtual COP of a netlist with test points must agree with plain COP on
+  // the netlist that really contains them (enable tied to 1).
+  const auto nl = random_netlist(30, 800, 20, 7);
+  std::vector<rith::TestPoint> tps;
+  std::mt19937_64 rng(3);
+  for (int k = 0; k < 12; ++k) {
+    rith::GateId g;
+    do g = static_cast<rith::GateId>(rng() % nl.size());
+    while (rith::is_source(nl.gate(g).type));
+    tps.push_back({g, static_cast<rith::TpKind>(k % 3)});
+  }
+  const auto v = rith::compute_cop_with(nl, tps);
+  const auto applied = rith::apply_test_points(nl, tps, "");
+  const auto c = rith::compute_cop(applied);
+  for (rith::GateId g = 0; g < nl.size(); ++g) {
+    const rith::GateId a = applied.find(nl.gate(g).name);
+    CHECK(a != rith::kNoGate);
+    CHECK(std::abs(v.p1[g] - c.p1[a]) < 1e-9);
+    CHECK(std::abs(v.obs[g] - c.obs[a]) < 1e-9);
+  }
+}
+
+TEST(tpi_raises_random_pattern_coverage) {
+  const auto nl = hard_netlist();
+  rith::TpiConfig cfg;
+  cfg.max_points = 4;
+  cfg.patterns = 256;
+  cfg.threads = 2;
+  const auto r = rith::select_test_points(nl, cfg);
+  CHECK(!r.points.empty() && r.points.size() <= 4);
+  CHECK(r.cost.size() == r.points.size() + 1);
+  CHECK(r.cost.back() < r.cost.front());
+  const auto before = rith::random_coverage(nl, {}, 256, 5);
+  const auto after = rith::random_coverage(nl, r.points, 256, 5);
+  CHECK(before.faults == after.faults);  // the same original faults are counted
+  CHECK(after.detected > before.detected);
+  // Selection is deterministic whatever the thread count.
+  cfg.threads = 1;
+  CHECK(rith::select_test_points(nl, cfg).points == r.points);
+}
+
+TEST(tpi_skips_dead_logic) {
+  // d drives nothing observable: no test point should go there.
+  auto nl = bench_str(
+      "INPUT(a)\nINPUT(b)\nINPUT(c)\nOUTPUT(y)\n"
+      "d = AND(a, b, c)\ne = NOT(d)\ny = OR(a, b)\n");
+  rith::TpiConfig cfg;
+  cfg.patterns = 64;
+  const auto r = rith::select_test_points(nl, cfg);
+  for (const auto& tp : r.points) CHECK(nl.gate(tp.net).name != "d" && nl.gate(tp.net).name != "e");
+  const auto cov = rith::random_coverage(nl, {}, 64);
+  CHECK(cov.unused > 0 && cov.coverage() == 1.0);
+}
+
+TEST(tpi_fixed_inputs_hold_their_value) {
+  // With b held at 0, nothing through the AND can be detected.
+  const auto nl = bench_str("INPUT(a)\nINPUT(b)\nOUTPUT(y)\ny = AND(a, b)\n");
+  rith::FaultSimulator sim(nl, rith::build_fault_list(nl, false));
+  const std::pair<std::size_t, bool> fix[] = {{1, false}};
+  const auto r = rith::run_random_patterns(sim, 256, 1, 0, fix);
+  CHECK(r.patterns == 256);  // patience 0: no early stop
+  for (std::size_t i = 0; i < r.faults; ++i) {
+    const auto d = rith::describe(nl, sim.fault_list().faults[i]);
+    const bool seen = sim.status(i) == rith::FaultStatus::Detected;
+    CHECK(seen == (d == "y SA1" || d == "b SA1"));
+  }
+}
+
+TEST(tpi_design_insertion_keeps_mission_mode) {
+  const auto lib = tiny_lib();
+  auto d = design_file("dc_style.v");
+  const auto before = rith::elaborate(d, &lib);
+  const std::vector<std::pair<std::string, rith::TpKind>> pts = {
+      {"n4", rith::TpKind::Control1}, {"n6", rith::TpKind::Control0}, {"n5", rith::TpKind::Observe}};
+  const auto ins = rith::insert_test_points(d, lib, pts);
+  CHECK(ins.flops == 3);
+  CHECK(ins.gates == 6);  // tiny.lib has no AND2/OR2: each control point is NAND2 + NAND2 + INV
+  CHECK(ins.clock == "clk");
+  const auto after = rith::elaborate(d, &lib);
+  rith::ScanResult tie;
+  tie.se_port = "tp_en";
+  const auto m = rith::verify_mission_mode(before, after, tie);
+  CHECK(m.ok);
+  if (!m.ok) std::cerr << "  " << m.message << "\n";
+  // The new flops then go on a scan chain like any other.
+  const auto r = rith::insert_scan(d, lib);
+  CHECK(r.scanned() == 6);
+  CHECK(rith::verify_shift(rith::elaborate(d, &lib), r).ok);
+  CHECK_THROWS(rith::insert_test_points(d, lib, pts), "tp_en");  // enable port already there
+  auto fresh = design_file("dc_style.v");
+  const auto w = rith::insert_test_points(fresh, lib, {{"no_such_net", rith::TpKind::Observe}});
+  CHECK(w.flops == 0 && w.warnings.size() == 1);
 }

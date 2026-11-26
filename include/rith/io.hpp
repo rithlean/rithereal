@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 
+#include "rith/liberty.hpp"
 #include "rith/netlist.hpp"
 
 namespace rith {
@@ -26,13 +27,15 @@ void write_bench(std::ostream& out, const Netlist& nl);
 //   * Yosys generic cells ($_AND_, $_OR_, $_NOT_, $_MUX_, $_DFF_P_, ...)
 //   * rith_dff / rith_mux2 (what write_verilog emits)
 //   * assign statements with a net, a constant or ~net on the right
+//   * cells from a Liberty library (Design Compiler, Genus, or Yosys + a PDK),
+//     expanded into primitive gates from each output pin's function and ff group
 // Bus declarations are expanded to bit nets named "bus[3]".
-// Liberty-mapped cells (Design Compiler, Genus, Yosys + PDK) come next.
-Netlist read_verilog(std::istream& in, const std::string& filename = "<verilog>");
+Netlist read_verilog(std::istream& in, const std::string& filename = "<verilog>",
+                     const Library* lib = nullptr);
 void write_verilog(std::ostream& out, const Netlist& nl);
 
 // Pick the format from the file extension (.bench or .v/.sv).
-Netlist read_netlist_file(const std::string& path);
+Netlist read_netlist_file(const std::string& path, const Library* lib = nullptr);
 void write_netlist_file(const std::string& path, const Netlist& nl);
 
 // Verilog identifier, escaped (\name followed by a space) when needed.

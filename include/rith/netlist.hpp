@@ -45,6 +45,7 @@ struct Gate {
   GateType type = GateType::Undefined;
   std::string name;
   GateId clock = kNoGate;  // only for Dff
+  bool falling_edge = false;  // only for Dff: clocked on the falling edge
 };
 
 class NetlistError : public std::runtime_error {
@@ -55,6 +56,8 @@ class NetlistError : public std::runtime_error {
 class Netlist {
  public:
   std::string name = "top";
+  // Non-fatal issues found while reading (e.g. asynchronous resets that were ignored).
+  std::vector<std::string> warnings;
 
   // ---- building -----------------------------------------------------------
   // Returns the gate with this name, creating an Undefined placeholder if needed.
@@ -62,7 +65,7 @@ class Netlist {
   // Gives a placeholder (or new gate) its type and fanins. Throws on a second driver.
   void define(GateId id, GateType type, std::vector<GateId> fanins = {});
   GateId add_gate(GateType type, std::string_view net, std::vector<GateId> fanins = {});
-  void set_clock(GateId flop, GateId clock);
+  void set_clock(GateId flop, GateId clock, bool falling_edge = false);
   void add_output(std::string port, GateId driver);
   // Validates arity and drivers, builds CSR fanin/fanout, topological order and levels.
   void finalize();

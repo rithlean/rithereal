@@ -1,0 +1,99 @@
+/* A tiny hand-written Liberty library for tests. Timing is omitted. */
+library (tiny) {
+  delay_model : table_lookup ;
+  time_unit : "1ns" ;
+  capacitive_load_unit (1, pf) ;
+  cell (INV_X1) {
+    area : 1.0 ;
+    pin (A) { direction : input ; capacitance : 0.001 ; }
+    pin (ZN) { direction : output ; function : "!A" ;
+      timing () { related_pin : "A" ; cell_rise (scalar) { values ("0.01") ; } }
+    }
+  }
+  cell (BUF_X1) {
+    pin (A) { direction : input ; }
+    pin (Z) { direction : output ; function : "A" ; }
+  }
+  cell (NAND2_X1) {
+    pin (A1) { direction : input ; }
+    pin (A2) { direction : input ; }
+    pin (ZN) { direction : output ; function : "!(A1 & A2)" ; }
+  }
+  cell (AND3_X1) {
+    pin (A1) { direction : input ; }
+    pin (A2) { direction : input ; }
+    pin (A3) { direction : input ; }
+    pin (ZN) { direction : output ; function : "A1 A2 A3" ; }
+  }
+  cell (AOI21_X1) {
+    pin (A) { direction : input ; }
+    pin (B1) { direction : input ; }
+    pin (B2) { direction : input ; }
+    pin (ZN) { direction : output ; function : "!(A | (B1 & B2))" ; }
+  }
+  cell (OAI21_X1) {
+    pin (A) { direction : input ; }
+    pin (B1) { direction : input ; }
+    pin (B2) { direction : input ; }
+    pin (ZN) { direction : output ; function : "(A' + (B1+B2)')" ; }
+  }
+  cell (XOR2_X1) {
+    pin (A) { direction : input ; }
+    pin (B) { direction : input ; }
+    pin (Z) { direction : output ; function : "(A ^ B)" ; }
+  }
+  cell (MUX2_X1) {
+    pin (A) { direction : input ; }
+    pin (B) { direction : input ; }
+    pin (S) { direction : input ; }
+    pin (Z) { direction : output ; function : "((S & B) | (A & !S))" ; }
+  }
+  cell (HA_X1) {
+    pin (A) { direction : input ; }
+    pin (B) { direction : input ; }
+    pin (CO) { direction : output ; function : "(A & B)" ; }
+    pin (S) { direction : output ; function : "(A ^ B)" ; }
+  }
+  cell (TIEHI_X1) {
+    pin (Z) { direction : output ; function : "1" ; }
+  }
+  cell (FILLCELL_X1) {
+    area : 0.5 ;
+  }
+  cell (DFF_X1) {
+    ff (IQ, IQN) { next_state : "D" ; clocked_on : "CK" ; }
+    pin (D) { direction : input ; }
+    pin (CK) { direction : input ; clock : true ; }
+    pin (Q) { direction : output ; function : "IQ" ; }
+    pin (QN) { direction : output ; function : "IQN" ; }
+  }
+  cell (DFFR_X1) {
+    ff (IQ, IQN) { next_state : "D" ; clocked_on : "CK" ; clear : "!RN" ; }
+    pin (D) { direction : input ; }
+    pin (RN) { direction : input ; }
+    pin (CK) { direction : input ; clock : true ; }
+    pin (Q) { direction : output ; function : "IQ" ; }
+  }
+  cell (SDFF_X1) {
+    ff (IQ, IQN) { next_state : "((SE & SI) | (!SE & D))" ; clocked_on : "CK" ; }
+    pin (D) { direction : input ; }
+    pin (SE) { direction : input ; }
+    pin (SI) { direction : input ; }
+    pin (CK) { direction : input ; clock : true ; }
+    pin (Q) { direction : output ; function : "IQ" ; }
+    test_cell () {
+      ff (IQ, IQN) { next_state : "D" ; clocked_on : "CK" ; }
+      pin (D) { direction : input ; }
+      pin (SE) { direction : input ; signal_type : test_scan_enable ; }
+      pin (SI) { direction : input ; signal_type : test_scan_in ; }
+      pin (CK) { direction : input ; }
+      pin (Q) { direction : output ; function : "IQ" ; signal_type : test_scan_out ; }
+    }
+  }
+  cell (DLH_X1) {
+    latch (IQ, IQN) { enable : "G" ; data_in : "D" ; }
+    pin (D) { direction : input ; }
+    pin (G) { direction : input ; }
+    pin (Q) { direction : output ; function : "IQ" ; }
+  }
+}

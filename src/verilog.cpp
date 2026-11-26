@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cctype>
+#include <functional>
 #include <istream>
 #include <iterator>
 #include <map>
@@ -110,13 +111,14 @@ const std::map<std::string, GateType> kPrimitives = {
     {"xor", GateType::Xor}, {"xnor", GateType::Xnor}, {"not", GateType::Not}, {"buf", GateType::Buf},
 };
 
-const std::set<std::string> kHelperModules = {"rith_dff", "rith_mux2"};
+const std::set<std::string> kHelperModules = {"rith_dff", "rith_dffn", "rith_mux2"};
 
 struct Range { long msb = 0, lsb = 0; };
 
 class Parser {
  public:
-  Parser(std::vector<Tok> toks, std::string file) : t_(std::move(toks)), file_(std::move(file)) {}
+  Parser(std::vector<Tok> toks, std::string file, const Library* lib)
+      : t_(std::move(toks)), file_(std::move(file)), lib_(lib) {}
 
   Netlist run() {
     bool have_top = false;
@@ -136,6 +138,9 @@ class Parser {
       if (d == kNoGate) fail("output '" + bit + "' is never driven");
       nl_.add_output(bit, d);
     }
+    if (async_ignored_)
+      nl_.warnings.push_back(std::to_string(async_ignored_) +
+                             " flop(s) have asynchronous set/reset; they are assumed inactive in test mode");
     try {
       nl_.finalize();
     } catch (const NetlistError& e) {
@@ -416,22 +421,147 @@ class Parser {
       drive(out("Y"), type == "$_ANDNOT_" ? GateType::And : GateType::Or, {in("A"), nb});
     } else if (type == "$_MUX_" || type == "rith_mux2") {
       drive(out("Y"), GateType::Mux2, {in("S"), in("A"), in("B")});
-    } else if (type == "$_DFF_P_" || type == "rith_dff") {
+    } else if (type == "$_DFF_P_" || type == "rith_dff" || type == "$_DFF_N_" || type == "rith_dffn") {
       const GateId q = out("Q");
       drive(q, GateType::Dff, {in("D")});
-      nl_.set_clock(q, in("C"));
+      nl_.set_clock(q, in("C"), type == "$_DFF_N_" || type == "rith_dffn");
     } else if (type.rfind("$_DFF", 0) == 0 || type.rfind("$_SDFF", 0) == 0 || type.rfind("$_DLATCH", 0) == 0) {
       fail("Yosys cell '" + type + "' (negative edge, reset, enable or latch) is not supported yet");
+    } else if (const LibCell* lc = lib_ ? lib_->find(type) : nullptr) {
+      library_cell(*lc, inst, pins);
     } else {
-      fail("unknown cell '" + type + "' (instance '" + inst +
-           "'); Liberty cell mapping is not supported yet");
+      fail("unknown cell '" + type + "' (instance '" + inst + "')" +
+           (lib_ ? std::string(" is not in the Liberty library") : std::string("; pass its Liberty library")));
     }
+  }
+
+  // Expands a Liberty cell instance into primitive gates.
+  void library_cell(const LibCell& lc, const std::string& inst, const std::map<std::string, std::string>& pins) {
+    if (lc.has_latch) fail("latch cell '" + lc.name + "' (instance '" + inst + "') is not supported yet");
+    if (lc.has_statetable)
+      fail("cell '" + lc.name + "' (instance '" + inst + "') uses a statetable (e.g. a clock gate); not supported yet");
+    for (const auto& [pin, net] : pins)
+      if (!lc.pin(pin)) fail("cell '" + lc.name + "' has no pin '" + pin + "' (instance '" + inst + "')");
+
+    std::size_t tmp = 0;
+    auto fresh = [&] { return nl_.get_or_declare(inst + "/$" + std::to_string(tmp++)); };
+    auto net_of_output = [&](const LibPin& p) -> GateId {
+      auto it = pins.find(p.name);
+      if (it == pins.end() || it->second.empty()) return kNoGate;  // unconnected output
+      return nl_.get_or_declare(it->second);
+    };
+
+    // State variables of a flop: IQ is the flop gate itself, IQN its inverse.
+    GateId flop = kNoGate, flop_n = kNoGate;
+    const LibFlop* ff = lc.flop ? &*lc.flop : nullptr;
+    if (ff) {
+      for (const auto& p : lc.pins)  // name the flop after the net its Q pin drives
+        if (p.dir == LibPin::Dir::Output && trim_copy(p.function) == ff->iq) {
+          flop = net_of_output(p);
+          if (flop != kNoGate) break;
+        }
+      if (flop == kNoGate) flop = nl_.get_or_declare(inst + "/" + ff->iq);
+    }
+
+    // Builds gates for an expression; returns the gate driving its value.
+    std::function<GateId(const LibExpr&, GateId)> build = [&](const LibExpr& e, GateId out) -> GateId {
+      auto place = [&](GateType t, std::vector<GateId> fi) {
+        const GateId g = out != kNoGate ? out : fresh();
+        drive(g, t, std::move(fi));
+        return g;
+      };
+      switch (e.op) {
+        case LibExpr::Op::Const0: return place(GateType::Const0, {});
+        case LibExpr::Op::Const1: return place(GateType::Const1, {});
+        case LibExpr::Op::Var: {
+          GateId src;
+          if (ff && e.var == ff->iq) src = flop;
+          else if (ff && !ff->iqn.empty() && e.var == ff->iqn) {
+            if (flop_n == kNoGate) {
+              flop_n = nl_.get_or_declare(inst + "/" + ff->iqn);
+              drive(flop_n, GateType::Not, {flop});
+            }
+            src = flop_n;
+          } else {
+            const LibPin* p = lc.pin(e.var);
+            if (!p || p->dir == LibPin::Dir::Output)
+              fail("function of cell '" + lc.name + "' uses unknown input '" + e.var + "'");
+            auto it = pins.find(e.var);
+            if (it == pins.end() || it->second.empty())
+              fail("instance '" + inst + "' of '" + lc.name + "' has no connection on input " + e.var);
+            src = nl_.get_or_declare(it->second);
+          }
+          return out == kNoGate ? src : place(GateType::Buf, {src});
+        }
+        case LibExpr::Op::Not: {
+          // Fold NOT over AND/OR/XOR into NAND/NOR/XNOR.
+          const LibExpr& a = e.args[0];
+          if (a.op == LibExpr::Op::And || a.op == LibExpr::Op::Or || a.op == LibExpr::Op::Xor) {
+            std::vector<GateId> fi;
+            for (const auto& x : a.args) fi.push_back(build(x, kNoGate));
+            return place(a.op == LibExpr::Op::And ? GateType::Nand
+                         : a.op == LibExpr::Op::Or ? GateType::Nor : GateType::Xnor, std::move(fi));
+          }
+          return place(GateType::Not, {build(a, kNoGate)});
+        }
+        case LibExpr::Op::And:
+        case LibExpr::Op::Or:
+        case LibExpr::Op::Xor: {
+          std::vector<GateId> fi;
+          for (const auto& x : e.args) fi.push_back(build(x, kNoGate));
+          return place(e.op == LibExpr::Op::And ? GateType::And
+                       : e.op == LibExpr::Op::Or ? GateType::Or : GateType::Xor, std::move(fi));
+        }
+      }
+      return kNoGate;
+    };
+    auto parse_fn = [&](const std::string& text) {
+      try { return parse_liberty_function(text); }
+      catch (const std::exception& ex) { fail("cell '" + lc.name + "': " + ex.what()); }
+    };
+
+    if (ff) {
+      if (ff->next_state.empty() || ff->clocked_on.empty())
+        fail("flop cell '" + lc.name + "' lacks next_state or clocked_on");
+      const GateId d = build(parse_fn(ff->next_state), kNoGate);
+      drive(flop, GateType::Dff, {d});
+      const LibExpr clk = parse_fn(ff->clocked_on);
+      const bool falling = clk.op == LibExpr::Op::Not && clk.args[0].op == LibExpr::Op::Var;
+      const LibExpr& clk_pin = falling ? clk.args[0] : clk;
+      if (clk_pin.op != LibExpr::Op::Var)
+        fail("flop cell '" + lc.name + "' has clocked_on \"" + ff->clocked_on +
+             "\"; only a single clock pin (either edge) is supported");
+      auto it = pins.find(clk_pin.var);
+      if (it != pins.end() && !it->second.empty())
+        nl_.set_clock(flop, nl_.get_or_declare(it->second), falling);
+      if (!ff->clear.empty() || !ff->preset.empty()) ++async_ignored_;
+    }
+    for (const auto& p : lc.pins) {
+      if (p.dir != LibPin::Dir::Output) continue;
+      if (p.function.empty()) {
+        if (net_of_output(p) != kNoGate)
+          fail("output pin " + p.name + " of cell '" + lc.name + "' has no function");
+        continue;
+      }
+      const GateId out = net_of_output(p);
+      if (out == kNoGate) continue;      // unconnected output
+      if (out == flop) continue;         // Q pin already is the flop
+      build(parse_fn(p.function), out);
+    }
+  }
+
+  static std::string trim_copy(const std::string& s) {
+    const auto b = s.find_first_not_of(" \t");
+    if (b == std::string::npos) return {};
+    return s.substr(b, s.find_last_not_of(" \t") - b + 1);
   }
 
   std::vector<Tok> t_;
   std::string file_;
+  const Library* lib_ = nullptr;
   std::size_t p_ = 0;
   Netlist nl_;
+  std::size_t async_ignored_ = 0;
   std::map<std::string, Range> ranges_;
   std::vector<std::string> output_bits_;
   int anon_ = 0;
@@ -453,9 +583,9 @@ std::string verilog_identifier(std::string_view name) {
   return "\\" + std::string(name) + " ";
 }
 
-Netlist read_verilog(std::istream& in, const std::string& filename) {
+Netlist read_verilog(std::istream& in, const std::string& filename, const Library* lib) {
   std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  return Parser(Lexer(std::move(src), filename).run(), filename).run();
+  return Parser(Lexer(std::move(src), filename).run(), filename, lib).run();
 }
 
 // ---------------------------------------------------------------------------
@@ -470,9 +600,9 @@ void write_verilog(std::ostream& out, const Netlist& nl) {
       throw NetlistError("output '" + name + "' has the same name as an input");
     output_names.insert(name);
   }
-  bool need_clk = false, uses_dff = false, uses_mux = false;
+  bool need_clk = false, uses_dff = false, uses_dffn = false, uses_mux = false;
   for (GateId f : nl.flops()) {
-    uses_dff = true;
+    (nl.gate(f).falling_edge ? uses_dffn : uses_dff) = true;
     if (nl.gate(f).clock == kNoGate) need_clk = true;
   }
   uses_mux = nl.count(GateType::Mux2) > 0;
@@ -511,7 +641,7 @@ void write_verilog(std::ostream& out, const Netlist& nl) {
             << id(fi[2]) << "), .Y(" << id(g) << "));\n";
         break;
       case GateType::Dff:
-        out << "  rith_dff " << inst << " (.C(" << (gate.clock == kNoGate ? clk : id(gate.clock))
+        out << (gate.falling_edge ? "  rith_dffn " : "  rith_dff ") << inst << " (.C(" << (gate.clock == kNoGate ? clk : id(gate.clock))
             << "), .D(" << id(fi[0]) << "), .Q(" << id(g) << "));\n";
         break;
       default: {
@@ -530,6 +660,9 @@ void write_verilog(std::ostream& out, const Netlist& nl) {
   if (uses_dff)
     out << "\nmodule rith_dff (input C, input D, output reg Q);\n"
            "  always @(posedge C) Q <= D;\nendmodule\n";
+  if (uses_dffn)
+    out << "\nmodule rith_dffn (input C, input D, output reg Q);\n"
+           "  always @(negedge C) Q <= D;\nendmodule\n";
   if (uses_mux)
     out << "\nmodule rith_mux2 (input S, input A, input B, output Y);\n"
            "  assign Y = S ? B : A;\nendmodule\n";

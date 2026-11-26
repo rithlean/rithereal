@@ -18,10 +18,10 @@ Format format_of(const std::string& path) {
 }
 }  // namespace
 
-Netlist read_netlist_file(const std::string& path) {
+Netlist read_netlist_file(const std::string& path, const Library* lib) {
   std::ifstream in(path);
   if (!in) throw std::runtime_error("cannot open '" + path + "'");
-  return format_of(path) == Format::Bench ? read_bench(in, path) : read_verilog(in, path);
+  return format_of(path) == Format::Bench ? read_bench(in, path) : read_verilog(in, path, lib);
 }
 
 void write_netlist_file(const std::string& path, const Netlist& nl) {

@@ -17,7 +17,8 @@ add_library(rith_core
   src/sim.cpp
   src/bench.cpp
   src/verilog.cpp
-  src/file_io.cpp)
+  src/file_io.cpp
+  src/liberty.cpp)
 target_include_directories(rith_core PUBLIC include)
 if(MSVC)
   target_compile_options(rith_core PRIVATE /W4)

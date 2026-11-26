@@ -83,7 +83,7 @@ GateId Netlist::get_or_declare(std::string_view net) {
   if (finalized_) throw NetlistError("netlist is finalized; cannot add '" + std::string(net) + "'");
   if (GateId id = find(net); id != kNoGate) return id;
   const auto id = static_cast<GateId>(gates_.size());
-  gates_.push_back(Gate{GateType::Undefined, std::string(net), kNoGate});
+  gates_.push_back(Gate{GateType::Undefined, std::string(net), kNoGate, false});
   build_fanins_.emplace_back();
   by_name_.emplace(std::string(net), id);
   return id;
@@ -115,10 +115,11 @@ GateId Netlist::add_gate(GateType type, std::string_view net, std::vector<GateId
   return id;
 }
 
-void Netlist::set_clock(GateId flop, GateId clock) {
+void Netlist::set_clock(GateId flop, GateId clock, bool falling_edge) {
   Gate& g = gates_.at(flop);
   if (g.type != GateType::Dff) throw NetlistError("'" + g.name + "' is not a flop");
   g.clock = clock;
+  g.falling_edge = falling_edge;
 }
 
 void Netlist::add_output(std::string port, GateId driver) {

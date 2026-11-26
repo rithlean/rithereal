@@ -189,6 +189,69 @@ TEST(errors_are_reported) {
   CHECK_THROWS(verilog_str("module a(); endmodule module b(); endmodule"), "more than one module");
 }
 
+rith::Library tiny_lib() { return rith::read_liberty_file(kData + "/tiny.lib"); }
+
+TEST(liberty_cells) {
+  const auto lib = tiny_lib();
+  CHECK(lib.name == "tiny");
+  CHECK(lib.cells.size() == 15);
+  const auto* inv = lib.find("INV_X1");
+  CHECK(inv && inv->pin("ZN") && inv->pin("ZN")->function == "!A");
+  CHECK(inv && inv->pin("A")->dir == rith::LibPin::Dir::Input);
+  const auto* dff = lib.find("DFF_X1");
+  CHECK(dff && dff->flop && dff->flop->iq == "IQ" && dff->flop->clocked_on == "CK" && !dff->is_scan);
+  const auto* sdff = lib.find("SDFF_X1");
+  CHECK(sdff && sdff->is_scan);
+  CHECK(sdff && sdff->pin("SE")->signal_type == "test_scan_enable");
+  CHECK(sdff && sdff->pin("SI")->signal_type == "test_scan_in");
+  CHECK(lib.find("DFFR_X1")->flop->clear == "!RN");
+  CHECK(lib.find("DLH_X1")->has_latch);
+}
+
+TEST(liberty_function_precedence) {
+  using Op = rith::LibExpr::Op;
+  auto e = rith::parse_liberty_function("A ^ B & C");  // XOR binds tighter than AND
+  CHECK(e.op == Op::And && e.args.size() == 2 && e.args[0].op == Op::Xor);
+  e = rith::parse_liberty_function("A B | C'");  // juxtaposition is AND, ' is NOT
+  CHECK(e.op == Op::Or && e.args[0].op == Op::And && e.args[1].op == Op::Not);
+  e = rith::parse_liberty_function("!(A1 & A2 & A3)");
+  CHECK(e.op == Op::Not && e.args[0].op == Op::And && e.args[0].args.size() == 3);
+  e = rith::parse_liberty_function("1");
+  CHECK(e.op == Op::Const1);
+  CHECK_THROWS(rith::parse_liberty_function("(A & B"), "missing ')'");
+}
+
+TEST(design_compiler_style_netlist) {
+  const auto lib = tiny_lib();
+  const auto nl = rith::read_netlist_file(kData + "/dc_style.v", &lib);
+  CHECK(nl.name == "counter_dc");
+  CHECK(nl.flops().size() == 3);
+  CHECK(nl.find("cnt[0]") != rith::kNoGate && nl.gate(nl.find("cnt[0]")).type == rith::GateType::Dff);
+  CHECK(nl.gate(nl.find("cnt[0]")).clock == nl.find("clk"));
+  CHECK(nl.warnings.size() == 1 && nl.warnings[0].find("asynchronous") != std::string::npos);
+  const auto r = rith::compare_by_simulation(nl, load("dc_style_ref.bench"));
+  CHECK(r.equivalent);
+  if (!r.equivalent) std::cerr << "  " << r.mismatch << "\n";
+  // Mapped netlist -> generic Verilog -> back is still equivalent.
+  const auto again = verilog_str(to_verilog(nl));
+  CHECK(rith::compare_by_simulation(nl, again).equivalent);
+}
+
+TEST(liberty_errors) {
+  const auto lib = tiny_lib();
+  auto with_lib = [&](const std::string& src) {
+    std::istringstream in(src);
+    return rith::read_verilog(in, "<t>", &lib);
+  };
+  CHECK_THROWS(with_lib("module m(input d, input g, output q); DLH_X1 l (.D(d), .G(g), .Q(q)); endmodule"),
+               "latch cell");
+  CHECK_THROWS(with_lib("module m(input a, output y); NOR9_X1 u (.A(a), .ZN(y)); endmodule"),
+               "not in the Liberty library");
+  CHECK_THROWS(with_lib("module m(input a, output y); INV_X1 u (.X(a), .ZN(y)); endmodule"), "has no pin 'X'");
+  CHECK_THROWS(with_lib("module m(input a, output y); NAND2_X1 u (.A1(a), .ZN(y)); endmodule"),
+               "no connection on input A2");
+}
+
 }  // namespace
 
 int main() {

@@ -286,15 +286,16 @@ std::size_t FaultSimulator::simulate_block(std::span<const Word> pi, std::span<c
 }
 
 RandomFaultSimResult run_random_patterns(FaultSimulator& sim, std::size_t max_patterns, std::uint64_t seed,
-                                         std::size_t patience) {
+                                         std::size_t patience, std::span<const std::pair<std::size_t, bool>> fixed) {
   const Netlist& nl = sim.netlist();
   std::mt19937_64 rng(seed);
   std::vector<Word> pi(nl.inputs().size()), st(nl.flops().size());
   std::size_t quiet = 0;
   const std::size_t total = sim.fault_list().faults.size();
-  while (sim.patterns_simulated() < max_patterns && sim.detected() < total && quiet < patience) {
+  while (sim.patterns_simulated() < max_patterns && sim.detected() < total && (patience == 0 || quiet < patience)) {
     for (auto& w : pi) w = rng();
     for (auto& w : st) w = rng();
+    for (const auto& [i, v] : fixed) pi.at(i) = v ? kAllOnes : 0;
     const std::size_t left = max_patterns - sim.patterns_simulated();
     const Word valid = left >= 64 ? kAllOnes : ((Word{1} << left) - 1);
     quiet = sim.simulate_block(pi, st, valid) ? 0 : quiet + 1;

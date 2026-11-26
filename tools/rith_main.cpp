@@ -11,6 +11,7 @@
 #include "rith/design.hpp"
 #include "rith/io.hpp"
 #include "rith/scan.hpp"
+#include "rith/tpi.hpp"
 #include "rith/fault.hpp"
 #include "rith/sim.hpp"
 #include "rith/testability.hpp"
@@ -32,6 +33,9 @@ constexpr const char* kUsage =
     "        [--se test_se] [--si-prefix test_si] [--so-prefix test_so]\n"
     "        [--def scan.def] [--stil scan.spf] [--tessent prefix] [--report file] [--no-verify]\n"
     "                                                      insert mux-D scan chains, keep cell names\n"
+    "  rith [--lib cells.lib ...] tpi <netlist> [--points K] [--patterns N] [--seed S]\n"
+    "        [--observe-only | --control-only] [--cop-only] [-o out] [--enable tp_en] [--clock CK]\n"
+    "                                                      test point insertion (greedy, COP + fault sim)\n"
     "\n"
     "Formats are chosen by extension: .bench, .v. Use --lib (repeatable) for netlists\n"
     "mapped to a cell library, such as Design Compiler or Genus output.\n";
@@ -223,6 +227,86 @@ int scan(const std::vector<std::string>& args) {
   return status;
 }
 
+bool ends_with(const std::string& s, const std::string& suffix) {
+  return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+int tpi(const std::vector<std::string>& args) {
+  const std::string in = args[1];
+  const bool design_mode = g_lib && (ends_with(in, ".v") || ends_with(in, ".vg") || ends_with(in, ".sv"));
+  rith::Design d;
+  rith::Netlist nl;
+  std::vector<char> allowed;
+  if (design_mode) {
+    d = rith::read_verilog_design_file(in);
+    nl = rith::elaborate(d, g_lib, in).netlist;
+    // Test points go on real nets of the netlist, not inside cells.
+    allowed.assign(nl.size(), 0);
+    for (rith::GateId g = 0; g < nl.size(); ++g) allowed[g] = d.find_net(nl.gate(g).name) != rith::kNoNet;
+  } else {
+    nl = load(in);
+  }
+  for (const auto& w : nl.warnings) std::cerr << "warning: " << in << ": " << w << "\n";
+
+  rith::TpiConfig cfg;
+  cfg.max_points = option(args, "--points", 16);
+  cfg.patterns = option(args, "--patterns", 32768);
+  cfg.observe = !flag(args, "--control-only");
+  cfg.control = !flag(args, "--observe-only");
+  cfg.allowed = allowed;
+  const std::size_t seed = option(args, "--seed", 1);
+  cfg.seed = seed;
+  if (flag(args, "--cop-only")) cfg.refine_every = 0;
+  const std::string enable = text_option(args, "--enable", "tp_en");
+
+  auto t0 = std::chrono::steady_clock::now();
+  const auto r = rith::select_test_points(nl, cfg);
+  const double select_s = seconds_since(t0);
+  std::printf("design        %s (%zu gates, %zu flops)\n", nl.name.c_str(), nl.size(), nl.flops().size());
+  const std::string how =
+      cfg.refine_every ? ", re-aimed by fault sim every " + std::to_string(cfg.refine_every) + " points" : "";
+  std::printf("test points   %zu chosen in %.2f s (greedy on COP%s; cost = expected escapes after %zu patterns)\n",
+              r.points.size(), select_s, how.c_str(), cfg.patterns);
+  std::printf("\n  #  kind        net                              expected escapes\n");
+  std::printf("  -  -           -                                %.1f\n", r.cost[0]);
+  for (std::size_t k = 0; k < r.points.size(); ++k)
+    std::printf("%3zu  %-10s  %-32s %.1f\n", k + 1, std::string(rith::to_string(r.points[k].kind)).c_str(),
+                nl.gate(r.points[k].net).name.c_str(), r.cost[k + 1]);
+
+  t0 = std::chrono::steady_clock::now();
+  const auto before = rith::random_coverage(nl, {}, cfg.patterns, seed, enable);
+  const auto after = rith::random_coverage(nl, r.points, cfg.patterns, seed, enable);
+  std::printf("\nfault simulation, %zu random patterns, faults of the original logic (%zu):\n", cfg.patterns,
+              before.faults);
+  std::printf("  before  %.2f%% (%zu undetected)\n", 100 * before.coverage(), before.faults - before.detected);
+  std::printf("  after   %.2f%% (%zu undetected)   [%.2f s]\n", 100 * after.coverage(), after.faults - after.detected,
+              seconds_since(t0));
+
+  const std::string out = text_option(args, "-o", "");
+  if (out.empty()) return 0;
+  if (design_mode) {
+    const auto el_before = rith::elaborate(d, g_lib, in);
+    std::vector<std::pair<std::string, rith::TpKind>> pts;
+    for (const auto& p : r.points) pts.emplace_back(nl.gate(p.net).name, p.kind);
+    rith::TpDesignConfig dc;
+    dc.enable = enable;
+    dc.clock = text_option(args, "--clock", "");
+    const auto ins = rith::insert_test_points(d, *g_lib, pts, dc);
+    for (const auto& w : ins.warnings) std::cerr << "warning: " << w << "\n";
+    rith::ScanResult tie;  // mission-mode check with the test point enable held at 0
+    tie.se_port = enable;
+    const auto m = rith::verify_mission_mode(el_before, rith::elaborate(d, g_lib, out), tie);
+    std::printf("\ninserted      %zu flops and %zu gates, clocked by %s; mission mode (%s = 0) %s\n", ins.flops,
+                ins.gates, ins.clock.c_str(), enable.c_str(), m.ok ? "unchanged" : ("CHANGED: " + m.message).c_str());
+    rith::write_verilog_design_file(out, d);
+    std::cout << "wrote " << out << " (run 'rith scan' on it to put the new flops on chains)\n";
+    return m.ok ? 0 : 1;
+  }
+  rith::write_netlist_file(out, rith::apply_test_points(nl, r.points, enable));
+  std::cout << "wrote " << out << "\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -241,6 +325,7 @@ int main(int argc, char** argv) {
     if (args.size() >= 2 && args[0] == "faultsim") return faultsim(args);
     if (args.size() >= 2 && args[0] == "testability") return testability(args);
     if (args.size() >= 2 && args[0] == "scan") return scan(args);
+    if (args.size() >= 2 && args[0] == "tpi") return tpi(args);
     std::cerr << kUsage;
     return 2;
   } catch (const std::exception& e) {

@@ -103,8 +103,11 @@ struct RandomFaultSimResult {
 };
 
 // Random-pattern fault simulation. Stops after max_patterns, when every fault
-// is detected, or after `patience` blocks of 64 in a row detect nothing new.
+// is detected, or after `patience` blocks of 64 in a row detect nothing new
+// (patience 0: never stop early). `fixed` holds inputs (index into
+// nl.inputs()) at a constant value, such as a test-mode enable.
 RandomFaultSimResult run_random_patterns(FaultSimulator& sim, std::size_t max_patterns,
-                                         std::uint64_t seed = 1, std::size_t patience = 64);
+                                         std::uint64_t seed = 1, std::size_t patience = 64,
+                                         std::span<const std::pair<std::size_t, bool>> fixed = {});
 
 }  // namespace rith

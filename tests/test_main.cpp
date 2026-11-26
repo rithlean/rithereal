@@ -12,7 +12,9 @@
 #include <random>
 
 #include "rith/fault.hpp"
+#include "rith/design.hpp"
 #include "rith/io.hpp"
+#include "rith/scan.hpp"
 #include "rith/sim.hpp"
 #include "rith/testability.hpp"
 
@@ -201,7 +203,7 @@ rith::Library tiny_lib() { return rith::read_liberty_file(kData + "/tiny.lib"); 
 TEST(liberty_cells) {
   const auto lib = tiny_lib();
   CHECK(lib.name == "tiny");
-  CHECK(lib.cells.size() == 15);
+  CHECK(lib.cells.size() == 21);
   const auto* inv = lib.find("INV_X1");
   CHECK(inv && inv->pin("ZN") && inv->pin("ZN")->function == "!A");
   CHECK(inv && inv->pin("A")->dir == rith::LibPin::Dir::Input);
@@ -506,4 +508,193 @@ int main() {
   }
   std::cout << registry().size() - failed_tests << "/" << registry().size() << " tests passed\n";
   return failed_tests == 0 ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Structural view and scan insertion
+// ---------------------------------------------------------------------------
+namespace {
+
+rith::Design design_file(const std::string& f) { return rith::read_verilog_design_file(kData + "/" + f); }
+std::string design_text(const rith::Design& d) {
+  std::ostringstream o;
+  rith::write_verilog_design(o, d);
+  return o.str();
+}
+rith::Design design_str(const std::string& s) {
+  std::istringstream in(s);
+  return rith::read_verilog_design(in);
+}
+
+}  // namespace
+
+TEST(design_roundtrip_keeps_cells_and_buses) {
+  const auto lib = tiny_lib();
+  for (const char* f : {"dc_style.v", "scan_domains.v", "yosys_small.v", "primitives.v"}) {
+    const auto d = design_file(f);
+    const auto text = design_text(d);
+    const auto again = design_str(text);
+    CHECK(design_text(again) == text);  // writer is idempotent
+    const auto a = rith::elaborate(d, &lib).netlist;
+    const auto b = rith::elaborate(again, &lib).netlist;
+    const auto r = rith::compare_by_simulation(a, b);
+    CHECK(r.equivalent);
+    if (!r.equivalent) std::cerr << "  " << f << ": " << r.mismatch << "\n";
+  }
+  const auto d = design_file("scan_domains.v");
+  const auto text = design_text(d);
+  CHECK(text.find("output [1:0] q;") != std::string::npos);
+  CHECK(text.find("wire   [3:0] spare;") != std::string::npos);
+  CHECK(text.find("DFFR_X1 \\r2_reg[0]  (") != std::string::npos);
+  CHECK(text.find("assign q[1] = spare[2];") != std::string::npos);
+  CHECK(d.ports.size() == 11 && d.ports[6].name == "bus[1]");
+}
+
+TEST(scan_cells_are_found_by_function) {
+  const auto lib = tiny_lib();
+  auto pins = rith::find_scan_pins(*lib.find("SDFF_X1"));
+  CHECK(pins && pins->si == "SI" && pins->se == "SE" && pins->se_active_high);
+  pins = rith::find_scan_pins(*lib.find("SDFFN_X1"));  // named SEN, active low, no signal_type
+  CHECK(pins && pins->si == "SI" && pins->se == "SEN" && !pins->se_active_high);
+  CHECK(!rith::find_scan_pins(*lib.find("DFF_X1")));
+  auto eq = [&](const char* from) {
+    auto e = rith::find_scan_equivalent(lib, *lib.find(from));
+    return e ? e->cell->name : std::string("none");
+  };
+  CHECK(eq("DFF_X1") == "SDFF_X1");
+  // DFFR_X1 has QN but SDFFR_X1 has not: fine only when QN is not used.
+  CHECK(eq("DFFR_X1") == "none");
+  const std::vector<std::string> only_q = {"Q"};
+  const auto r_q = rith::find_scan_equivalent(lib, *lib.find("DFFR_X1"), &only_q);
+  CHECK(r_q && r_q->cell->name == "SDFFR_X1");
+  CHECK(eq("DFFN_X1") == "SDFFN_X1");
+  CHECK(eq("DFFQN_X1") == "SDFFQN_X1");
+  CHECK(eq("SDFF_X1") == "SDFF_X1");   // already a scan cell
+  CHECK(eq("DFFE_X1") == "none");
+}
+
+TEST(scan_insertion_dc_style) {
+  const auto lib = tiny_lib();
+  auto d = design_file("dc_style.v");
+  const auto before = rith::elaborate(d, &lib);
+  const auto r = rith::insert_scan(d, lib);
+  CHECK(r.chains.size() == 1);
+  CHECK(r.scanned() == 3 && r.replaced == 2 && r.restitched == 1 && r.excluded.empty());
+  CHECK(r.replaced_cells.at("DFF_X1") == "SDFF_X1" && r.replaced_cells.at("DFFR_X1") == "SDFFR_X1");
+  const auto after = rith::elaborate(d, &lib);
+  const auto m = rith::verify_mission_mode(before, after, r);
+  CHECK(m.ok);
+  if (!m.ok) std::cerr << "  " << m.message << "\n";
+  const auto s = rith::verify_shift(after, r);
+  CHECK(s.ok);
+  if (!s.ok) std::cerr << "  " << s.message << "\n";
+  // The written netlist reads back to the same thing.
+  const auto again = rith::elaborate(design_str(design_text(d)), &lib);
+  CHECK(rith::verify_shift(again, r).ok);
+  CHECK(design_text(d).find("SDFFR_X1 \\cnt_reg[1]  ( .D(n3), .RN(rst_n), .CK(clk), .Q(\\cnt[1] ), .SI(") !=
+        std::string::npos);
+}
+
+TEST(scan_insertion_clock_domains) {
+  const auto lib = tiny_lib();
+  auto d = design_file("scan_domains.v");
+  const auto before = rith::elaborate(d, &lib);
+  const auto r = rith::insert_scan(d, lib);
+  // clk1 rising (r1, r2, r3, r9), clk1 falling (r4), clk2 falling (r5, clocked
+  // through an inverter) and clk2 rising (r6). r7 has a gated clock and r8 has
+  // no scan version.
+  CHECK(r.chains.size() == 4);
+  CHECK(r.scanned() == 7);
+  CHECK(r.excluded.size() == 2);
+  std::map<std::string, std::size_t> len;
+  for (const auto& c : r.chains) len[c.clock + (c.falling_edge ? "-" : "+")] = c.cells.size();
+  CHECK(len["clk1+"] == 4 && len["clk1-"] == 1 && len["clk2-"] == 1 && len["clk2+"] == 1);
+  bool inverted = false;
+  for (const auto& c : r.chains) inverted |= c.inverted();
+  CHECK(inverted);  // r3 only has QN
+  const auto after = rith::elaborate(d, &lib);
+  CHECK(rith::verify_mission_mode(before, after, r).ok);
+  const auto s = rith::verify_shift(after, r);
+  CHECK(s.ok);
+  if (!s.ok) std::cerr << "  " << s.message << "\n";
+  // The active-low scan enable of SDFFN_X1 got an inverter.
+  bool has_inv = false;
+  for (const auto& i : d.instances) has_inv |= i.name == "rith_se_inv";
+  CHECK(has_inv);
+}
+
+TEST(scan_chain_count_and_balance) {
+  const auto lib = tiny_lib();
+  {
+    auto d = design_file("scan_domains.v");
+    rith::ScanConfig cfg;
+    cfg.chains = 6;
+    const auto r = rith::insert_scan(d, lib, cfg);
+    CHECK(r.chains.size() == 6);
+    std::size_t longest = 0;
+    for (const auto& c : r.chains) longest = std::max(longest, c.cells.size());
+    CHECK(longest == 2);  // the 4 clk1 rising flops get the 2 spare chains: 2 + 1 + 1
+    CHECK(rith::verify_shift(rith::elaborate(d, &lib), r).ok);
+  }
+  {
+    auto d = design_file("scan_domains.v");
+    rith::ScanConfig cfg;
+    cfg.max_length = 3;
+    const auto r = rith::insert_scan(d, lib, cfg);
+    CHECK(r.chains.size() == 5);
+  }
+  {
+    auto d = design_file("scan_domains.v");
+    rith::ScanConfig cfg;
+    cfg.chains = 3;
+    CHECK_THROWS(rith::insert_scan(d, lib, cfg), "clock domains");
+  }
+  {
+    auto d = design_file("scan_domains.v");
+    rith::ScanConfig cfg;
+    cfg.so_prefix = "y";  // "y1" is already an output
+    CHECK_THROWS(rith::insert_scan(d, lib, cfg), "'y1' is already used");
+  }
+}
+
+TEST(scan_checks_catch_a_broken_chain) {
+  const auto lib = tiny_lib();
+  auto d = design_file("scan_domains.v");
+  const auto before = rith::elaborate(d, &lib);
+  const auto r = rith::insert_scan(d, lib);
+  const rith::ScanChain* longest = &r.chains[0];
+  for (const auto& c : r.chains)
+    if (c.cells.size() > longest->cells.size()) longest = &c;
+  // Feed the third cell from the scan-in port: the second cell is skipped.
+  auto broken = d;
+  auto& third = broken.instances[longest->cells[2].instance];
+  third.connect(longest->cells[2].si_pin, broken.find_net(longest->si_port));
+  const auto s = rith::verify_shift(rith::elaborate(broken, &lib), r);
+  CHECK(!s.ok && s.message.find("does not hold") != std::string::npos);
+  // Driving a flop's D from the scan-in port changes mission mode.
+  auto changed = d;
+  auto& first = changed.instances[longest->cells[0].instance];
+  first.connect("D", changed.find_net(longest->si_port));
+  const auto m = rith::verify_mission_mode(before, rith::elaborate(changed, &lib), r);
+  CHECK(!m.ok && m.message.find("next state of flop") != std::string::npos);
+}
+
+TEST(scan_outputs) {
+  const auto lib = tiny_lib();
+  auto d = design_file("dc_style.v");
+  const auto r = rith::insert_scan(d, lib);
+  std::ostringstream def, stil, dofile, proc, report;
+  rith::write_def_scanchains(def, d, r);
+  rith::write_stil_protocol(stil, d, r);
+  rith::write_tessent_dofile(dofile, d, r, "counter_dc.testproc");
+  rith::write_tessent_testproc(proc, d, r);
+  rith::write_scan_report(report, d, r);
+  CHECK(def.str().find("SCANCHAINS 1 ;") != std::string::npos);
+  CHECK(def.str().find("cnt_reg\\[0\\] ( IN SI ) ( OUT Q )") != std::string::npos);
+  CHECK(def.str().find("+ START PIN test_si1") != std::string::npos);
+  CHECK(stil.str().find("ScanLength 3;") != std::string::npos);
+  CHECK(stil.str().find("\"test_si1\" In { ScanIn; }") != std::string::npos);
+  CHECK(dofile.str().find("add_scan_chains chain1 grp1 test_si1 test_so1") != std::string::npos);
+  CHECK(proc.str().find("apply shift 3 ;") != std::string::npos);
+  CHECK(report.str().find("DFF_X1 -> SDFF_X1") != std::string::npos);
 }

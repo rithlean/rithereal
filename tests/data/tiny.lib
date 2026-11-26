@@ -73,6 +73,7 @@ library (tiny) {
     pin (RN) { direction : input ; }
     pin (CK) { direction : input ; clock : true ; }
     pin (Q) { direction : output ; function : "IQ" ; }
+    pin (QN) { direction : output ; function : "IQN" ; }
   }
   cell (SDFF_X1) {
     ff (IQ, IQN) { next_state : "((SE & SI) | (!SE & D))" ; clocked_on : "CK" ; }
@@ -81,6 +82,7 @@ library (tiny) {
     pin (SI) { direction : input ; }
     pin (CK) { direction : input ; clock : true ; }
     pin (Q) { direction : output ; function : "IQ" ; }
+    pin (QN) { direction : output ; function : "IQN" ; }
     test_cell () {
       ff (IQ, IQN) { next_state : "D" ; clocked_on : "CK" ; }
       pin (D) { direction : input ; }
@@ -89,6 +91,53 @@ library (tiny) {
       pin (CK) { direction : input ; }
       pin (Q) { direction : output ; function : "IQ" ; signal_type : test_scan_out ; }
     }
+  }
+  cell (SDFFR_X1) {
+    ff (IQ, IQN) { next_state : "((SE & SI) | (!SE & D))" ; clocked_on : "CK" ; clear : "!RN" ; }
+    pin (D) { direction : input ; }
+    pin (RN) { direction : input ; }
+    pin (SE) { direction : input ; }
+    pin (SI) { direction : input ; }
+    pin (CK) { direction : input ; clock : true ; }
+    pin (Q) { direction : output ; function : "IQ" ; }
+  }
+  cell (DFFN_X1) {
+    ff (IQ, IQN) { next_state : "D" ; clocked_on : "!CKN" ; }
+    pin (D) { direction : input ; }
+    pin (CKN) { direction : input ; clock : true ; }
+    pin (Q) { direction : output ; function : "IQ" ; }
+  }
+  /* Scan enable is active low and named SEN; no signal_type given. */
+  cell (SDFFN_X1) {
+    ff (IQ, IQN) { next_state : "(D SEN) | (SI !SEN)" ; clocked_on : "!CKN" ; }
+    pin (D) { direction : input ; }
+    pin (SI) { direction : input ; }
+    pin (SEN) { direction : input ; }
+    pin (CKN) { direction : input ; clock : true ; }
+    pin (Q) { direction : output ; function : "IQ" ; }
+  }
+  /* Only an inverted output. */
+  cell (DFFQN_X1) {
+    ff (IQ, IQN) { next_state : "D" ; clocked_on : "CK" ; }
+    pin (D) { direction : input ; }
+    pin (CK) { direction : input ; clock : true ; }
+    pin (QN) { direction : output ; function : "IQN" ; }
+  }
+  cell (SDFFQN_X1) {
+    ff (IQ, IQN) { next_state : "(SE SI) + (SE' D)" ; clocked_on : "CK" ; }
+    pin (D) { direction : input ; }
+    pin (SE) { direction : input ; }
+    pin (SI) { direction : input ; }
+    pin (CK) { direction : input ; clock : true ; }
+    pin (QN) { direction : output ; function : "IQN" ; }
+  }
+  /* Has no scan version in this library. */
+  cell (DFFE_X1) {
+    ff (IQ, IQN) { next_state : "(D & E) | (IQ & !E)" ; clocked_on : "CK" ; }
+    pin (D) { direction : input ; }
+    pin (E) { direction : input ; }
+    pin (CK) { direction : input ; clock : true ; }
+    pin (Q) { direction : output ; function : "IQ" ; }
   }
   cell (DLH_X1) {
     latch (IQ, IQN) { enable : "G" ; data_in : "D" ; }

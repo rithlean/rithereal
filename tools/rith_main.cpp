@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
 
+#include "rith/design.hpp"
 #include "rith/io.hpp"
+#include "rith/scan.hpp"
 #include "rith/fault.hpp"
 #include "rith/sim.hpp"
 #include "rith/testability.hpp"
@@ -25,6 +28,10 @@ constexpr const char* kUsage =
     "                                                      random-pattern stuck-at fault simulation\n"
     "  rith [--lib cells.lib ...] testability <netlist> [--top N]\n"
     "                                                      SCOAP/COP; lists the hardest-to-test nets\n"
+    "  rith  --lib cells.lib ...  scan <netlist.v> -o <out.v> [--chains N | --max-length L]\n"
+    "        [--se test_se] [--si-prefix test_si] [--so-prefix test_so]\n"
+    "        [--def scan.def] [--stil scan.spf] [--tessent prefix] [--report file] [--no-verify]\n"
+    "                                                      insert mux-D scan chains, keep cell names\n"
     "\n"
     "Formats are chosen by extension: .bench, .v. Use --lib (repeatable) for netlists\n"
     "mapped to a cell library, such as Design Compiler or Genus output.\n";
@@ -144,6 +151,78 @@ int testability(const std::vector<std::string>& args) {
   return 0;
 }
 
+std::string text_option(const std::vector<std::string>& args, const std::string& name, const std::string& fallback) {
+  for (std::size_t i = 0; i + 1 < args.size(); ++i)
+    if (args[i] == name) return args[i + 1];
+  return fallback;
+}
+
+bool flag(const std::vector<std::string>& args, const std::string& name) {
+  return std::find(args.begin(), args.end(), name) != args.end();
+}
+
+template <class F>
+void write_file(const std::string& path, F&& f) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot write '" + path + "'");
+  f(out);
+  std::cout << "wrote " << path << "\n";
+}
+
+int scan(const std::vector<std::string>& args) {
+  if (!g_lib) throw std::runtime_error("scan needs the cell library: rith --lib cells.lib scan ...");
+  const std::string in = args[1];
+  const std::string out = text_option(args, "-o", "");
+  if (out.empty()) throw std::runtime_error("scan needs an output netlist: -o out.v");
+  rith::ScanConfig cfg;
+  cfg.chains = option(args, "--chains", 0);
+  cfg.max_length = option(args, "--max-length", 0);
+  cfg.se_port = text_option(args, "--se", cfg.se_port);
+  cfg.si_prefix = text_option(args, "--si-prefix", cfg.si_prefix);
+  cfg.so_prefix = text_option(args, "--so-prefix", cfg.so_prefix);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  auto d = rith::read_verilog_design_file(in);
+  const auto before = rith::elaborate(d, g_lib, in);
+  for (const auto& w : before.netlist.warnings) std::cerr << "warning: " << in << ": " << w << "\n";
+  const auto r = rith::insert_scan(d, *g_lib, cfg);
+
+  std::size_t longest = 0;
+  for (const auto& c : r.chains) longest = std::max(longest, c.cells.size());
+  std::printf("design        %s\n", d.name.c_str());
+  std::printf("scan flops    %zu (%zu replaced, %zu already scan cells), %zu left off\n", r.scanned(), r.replaced,
+              r.restitched, r.excluded.size());
+  std::printf("chains        %zu, longest %zu\n", r.chains.size(), longest);
+  for (const auto& [inst, why] : r.excluded) std::printf("  left off %s: %s\n", inst.c_str(), why.c_str());
+  for (const auto& w : r.warnings) std::cerr << "warning: " << w << "\n";
+
+  int status = 0;
+  if (!flag(args, "--no-verify")) {
+    const auto after = rith::elaborate(d, g_lib, out);
+    const auto m = rith::verify_mission_mode(before, after, r);
+    std::printf("check         mission mode %s", m.ok ? "unchanged" : "CHANGED: ");
+    if (!m.ok) std::printf("%s", m.message.c_str());
+    const auto s = rith::verify_shift(after, r);
+    std::printf(", shift %s\n", s.ok ? "ok on every chain" : ("FAILED: " + s.message).c_str());
+    if (!m.ok || !s.ok) status = 1;
+  }
+  std::printf("time          %.3f s\n", seconds_since(t0));
+  rith::write_verilog_design_file(out, d);
+  std::cout << "wrote " << out << "\n";
+  if (auto p = text_option(args, "--def", ""); !p.empty())
+    write_file(p, [&](std::ostream& o) { rith::write_def_scanchains(o, d, r); });
+  if (auto p = text_option(args, "--stil", ""); !p.empty())
+    write_file(p, [&](std::ostream& o) { rith::write_stil_protocol(o, d, r); });
+  if (auto p = text_option(args, "--tessent", ""); !p.empty()) {
+    const std::string proc = p + ".testproc";
+    write_file(p + ".dofile", [&](std::ostream& o) { rith::write_tessent_dofile(o, d, r, proc); });
+    write_file(proc, [&](std::ostream& o) { rith::write_tessent_testproc(o, d, r); });
+  }
+  if (auto p = text_option(args, "--report", ""); !p.empty())
+    write_file(p, [&](std::ostream& o) { rith::write_scan_report(o, d, r); });
+  return status;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -161,6 +240,7 @@ int main(int argc, char** argv) {
       return equiv(args[1], args[2], args.size() == 4 ? std::stoul(args[3]) : 256);
     if (args.size() >= 2 && args[0] == "faultsim") return faultsim(args);
     if (args.size() >= 2 && args[0] == "testability") return testability(args);
+    if (args.size() >= 2 && args[0] == "scan") return scan(args);
     std::cerr << kUsage;
     return 2;
   } catch (const std::exception& e) {

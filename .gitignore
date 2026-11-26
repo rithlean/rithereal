@@ -3,3 +3,6 @@ build*/
 compile_commands.json
 *.swp
 .DS_Store
+
+# Local, licence-restricted files (e.g. SAED32 libraries and netlists). Never commit.
+private/

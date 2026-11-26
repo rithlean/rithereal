@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Self-contained tests (no external framework, so the build needs no network).
+#include <algorithm>
+#include <bit>
 #include <functional>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include <cmath>
+#include <random>
+
+#include "rith/fault.hpp"
 #include "rith/io.hpp"
 #include "rith/sim.hpp"
+#include "rith/testability.hpp"
 
 namespace {
 
@@ -250,6 +257,235 @@ TEST(liberty_errors) {
   CHECK_THROWS(with_lib("module m(input a, output y); INV_X1 u (.X(a), .ZN(y)); endmodule"), "has no pin 'X'");
   CHECK_THROWS(with_lib("module m(input a, output y); NAND2_X1 u (.A1(a), .ZN(y)); endmodule"),
                "no connection on input A2");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: faults, fault simulation, testability
+// ---------------------------------------------------------------------------
+
+// Reference: simulate the whole circuit with the fault injected, then compare
+// every observation point with the good circuit. Slow but obviously correct.
+rith::Word brute_force_detect(const rith::Netlist& nl, const rith::Fault& f, const std::vector<rith::Word>& pi,
+                              const std::vector<rith::Word>& st) {
+  using namespace rith;
+  const auto good = simulate(nl, pi, st);
+  const Word stuck = f.stuck_at_one ? kAllOnes : 0;
+  std::vector<Word> v(nl.size(), 0);
+  for (std::size_t i = 0; i < pi.size(); ++i) v[nl.inputs()[i]] = pi[i];
+  for (std::size_t i = 0; i < st.size(); ++i) v[nl.flops()[i]] = st[i];
+  for (GateId g : nl.topo_order()) {
+    const GateType t = nl.gate(g).type;
+    if (t != GateType::Input && t != GateType::Dff) {
+      const auto fi = nl.fanins(g);
+      v[g] = eval_gate(t, fi.size(), [&](std::size_t i) {
+        return (f.gate == g && f.pin == static_cast<int>(i)) ? stuck : v[fi[i]];
+      });
+    }
+    if (f.gate == g && f.pin == Fault::kOutputPin) v[g] = stuck;
+  }
+  Word det = 0;
+  for (const auto& [name, d] : nl.outputs()) det |= v[d] ^ good[d];
+  for (GateId ff : nl.flops()) {
+    const GateId d = nl.fanins(ff)[0];
+    const Word seen = (f.gate == ff && f.pin == 0) ? stuck : v[d];
+    det |= seen ^ good[d];
+  }
+  return det;
+}
+
+TEST(c17_fault_list) {
+  const auto nl = load("c17.bench");
+  const auto all = rith::build_fault_list(nl, false);
+  CHECK(all.uncollapsed == 34);  // 11 stems + 6 fanout branches, two faults each
+  CHECK(all.faults.size() == 34);
+  const auto fl = rith::build_fault_list(nl);
+  CHECK(fl.uncollapsed == 34);
+  CHECK(fl.faults.size() == 22);  // the textbook collapsed count for c17
+  std::size_t w = 0;
+  for (auto x : fl.weight) w += x;
+  CHECK(w == 34);
+}
+
+TEST(fault_simulator_matches_brute_force) {
+  const auto lib = tiny_lib();
+  std::vector<rith::Netlist> designs;
+  designs.push_back(load("c17.bench"));
+  designs.push_back(load("s27.bench"));
+  designs.push_back(load("small_ref.bench"));
+  designs.push_back(rith::read_netlist_file(kData + "/dc_style.v", &lib));
+  std::mt19937_64 rng(7);
+  for (const auto& nl : designs) {
+    const auto fl = rith::build_fault_list(nl, false);
+    rith::FaultSimulator sim(nl, fl);
+    for (int block = 0; block < 4; ++block) {
+      std::vector<rith::Word> pi(nl.inputs().size()), st(nl.flops().size());
+      for (auto& w : pi) w = rng();
+      for (auto& w : st) w = rng();
+      sim.simulate_block(pi, st, 0);  // valid = 0: just load the good values, drop nothing
+      for (const auto& f : fl.faults) {
+        const auto fast = sim.detect_mask(f), slow = brute_force_detect(nl, f, pi, st);
+        CHECK(fast == slow);
+        if (fast != slow) std::cerr << "  " << nl.name << ": " << rith::describe(nl, f) << "\n";
+      }
+    }
+  }
+}
+
+TEST(collapsed_faults_are_really_equivalent) {
+  // Every fault in a class must have the same detection mask as its representative.
+  const auto nl = load("s27.bench");
+  const auto all = rith::build_fault_list(nl, false);
+  const auto col = rith::build_fault_list(nl, true);
+  rith::FaultSimulator sim(nl, all);
+  std::mt19937_64 rng(3);
+  std::vector<rith::Word> pi(nl.inputs().size()), st(nl.flops().size());
+  for (auto& w : pi) w = rng();
+  for (auto& w : st) w = rng();
+  sim.simulate_block(pi, st, 0);
+  std::size_t distinct = 0;
+  std::vector<rith::Word> masks;
+  for (const auto& f : all.faults) masks.push_back(sim.detect_mask(f));
+  // Faults with identical masks are a superset of the equivalence classes, so
+  // the number of distinct masks can never exceed the number of classes.
+  std::sort(masks.begin(), masks.end());
+  distinct = static_cast<std::size_t>(std::unique(masks.begin(), masks.end()) - masks.begin());
+  CHECK(distinct <= col.faults.size());
+  CHECK(col.faults.size() < all.faults.size());
+}
+
+TEST(c17_reaches_full_coverage) {
+  const auto nl = load("c17.bench");
+  rith::FaultSimulator sim(nl, rith::build_fault_list(nl));
+  std::vector<rith::Word> pi(5, 0);  // all 32 patterns in one block
+  for (int p = 0; p < 32; ++p)
+    for (int i = 0; i < 5; ++i)
+      if (p >> i & 1) pi[i] |= rith::Word{1} << p;
+  sim.simulate_block(pi, {}, (rith::Word{1} << 32) - 1);
+  CHECK(sim.detected() == 22);
+  CHECK(sim.coverage() == 1.0);
+  CHECK(sim.coverage_uncollapsed() == 1.0);
+  CHECK(sim.patterns_simulated() == 32);
+  for (std::size_t i = 0; i < 22; ++i) CHECK(sim.first_detection(i) >= 0 && sim.first_detection(i) < 32);
+}
+
+TEST(random_patterns_and_redundant_fault) {
+  // y = a OR (a AND b) is just y = a, so the AND gate is redundant logic. Two fault
+  // classes can never be seen: {t SA0, b SA0, a->t SA0} and {b SA1}.
+  const auto nl = bench_str("INPUT(a)\nINPUT(b)\nOUTPUT(y)\nt = AND(a, b)\ny = OR(a, t)\n");
+  rith::FaultSimulator sim(nl, rith::build_fault_list(nl));
+  const auto r = rith::run_random_patterns(sim, 10000, 1, 8);
+  CHECK(r.detected == r.faults - 2);
+  CHECK(r.patterns < 10000);  // stopped early once nothing new was found
+  std::vector<std::string> undetected;
+  for (std::size_t i = 0; i < r.faults; ++i)
+    if (sim.status(i) == rith::FaultStatus::Undetected)
+      undetected.push_back(rith::describe(nl, sim.fault_list().faults[i]));
+  std::sort(undetected.begin(), undetected.end());
+  CHECK((undetected == std::vector<std::string>{"b SA0", "b SA1"}));  // b SA0 represents its class
+}
+
+TEST(unobservable_logic_is_left_out) {
+  // In dc_style.v, clk and rst_n have no modelled pins and the half adder's S output
+  // is unconnected, so faults there can never be seen and are counted as unused.
+  const auto lib = tiny_lib();
+  const auto nl = rith::read_netlist_file(kData + "/dc_style.v", &lib);
+  const auto fl = rith::build_fault_list(nl);
+  CHECK(fl.unused == 10);  // clk, rst_n, the S net, and the two branches feeding it: 5 x 2
+  rith::FaultSimulator sim(nl, fl);
+  const auto r = rith::run_random_patterns(sim, 100000, 1, 64);
+  CHECK(r.detected == r.faults - 1);  // only the tie-high redundancy in the MUX remains
+  for (std::size_t i = 0; i < r.faults; ++i)
+    if (sim.status(i) == rith::FaultStatus::Undetected)
+      CHECK(rith::describe(nl, sim.fault_list().faults[i]) == "U6/$1 SA1");
+}
+
+rith::Netlist random_netlist(std::size_t inputs, std::size_t gates, std::size_t flops, std::uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::ostringstream b;
+  std::vector<std::string> names;
+  for (std::size_t i = 0; i < inputs; ++i) { b << "INPUT(i" << i << ")\n"; names.push_back("i" + std::to_string(i)); }
+  for (std::size_t i = 0; i < flops; ++i) names.push_back("q" + std::to_string(i));
+  const char* types[] = {"AND", "NAND", "OR", "NOR", "XOR", "XNOR", "NOT", "BUFF"};
+  for (std::size_t k = 0; k < gates; ++k) {
+    const std::string t = types[rng() % 8];
+    const std::size_t window = std::min<std::size_t>(names.size(), 200);
+    auto pick = [&] { return names[names.size() - 1 - rng() % window]; };
+    b << "n" << k << " = " << t << "(" << pick();
+    if (t != "NOT" && t != "BUFF") b << ", " << pick();
+    b << ")\n";
+    names.push_back("n" + std::to_string(k));
+  }
+  for (std::size_t i = 0; i < flops; ++i) b << "q" << i << " = DFF(n" << gates / 2 + rng() % (gates / 2) << ")\n";
+  for (std::size_t k = gates - 20; k < gates; ++k) b << "OUTPUT(n" << k << ")\n";
+  return bench_str(b.str());
+}
+
+TEST(multithreaded_fault_simulation_is_deterministic) {
+  const auto nl = random_netlist(40, 3000, 60, 11);
+  const auto fl = rith::build_fault_list(nl);
+  CHECK(fl.faults.size() > 1000);  // enough faults to spread across threads
+  rith::FaultSimulator one(nl, fl, 1), many(nl, fl, 4);
+  const auto r1 = rith::run_random_patterns(one, 2048, 5);
+  const auto r4 = rith::run_random_patterns(many, 2048, 5);
+  CHECK(r1.detected == r4.detected);
+  CHECK(r1.patterns == r4.patterns);
+  for (std::size_t i = 0; i < fl.faults.size(); ++i) {
+    CHECK(one.status(i) == many.status(i));
+    CHECK(one.first_detection(i) == many.first_detection(i));
+  }
+}
+
+TEST(scoap_c17) {
+  const auto nl = load("c17.bench");
+  const auto s = rith::compute_scoap(nl);
+  auto id = [&](const char* n) { return nl.find(n); };
+  CHECK(s.cc0[id("1")] == 1 && s.cc1[id("1")] == 1);
+  CHECK(s.cc0[id("10")] == 3 && s.cc1[id("10")] == 2);  // NAND(1,3)
+  CHECK(s.cc0[id("16")] == 4 && s.cc1[id("16")] == 2);  // NAND(2, 11)
+  CHECK(s.co[id("22")] == 0 && s.co[id("23")] == 0);
+  CHECK(s.co[id("10")] == 3);  // CO(22) + CC1(16) + 1
+  CHECK(s.co[id("16")] == 3);  // min over both branches: 0 + CC1(10) + 1 = 3, 0 + CC1(19) + 1 = 3
+}
+
+TEST(scoap_flops_and_constants) {
+  const auto nl = load("s27.bench");
+  const auto s = rith::compute_scoap(nl);
+  for (auto f : nl.flops()) CHECK(s.cc0[f] == 1 && s.cc1[f] == 1);
+  CHECK(s.co[nl.find("G10")] == 0);  // drives a flop's D pin: a pseudo-output
+  const auto k = bench_str("INPUT(a)\nOUTPUT(y)\nz = CONST0()\ny = AND(a, z)\n");
+  const auto sk = rith::compute_scoap(k);
+  CHECK(sk.cc1[k.find("y")] >= rith::kScoapInf);  // y can never be 1
+  CHECK(sk.co[k.find("a")] >= rith::kScoapInf);   // a is never observable
+}
+
+TEST(cop_matches_exhaustive_probability) {
+  // On a fanout-free circuit COP is exact, so compare it with brute force.
+  const auto nl = bench_str(
+      "INPUT(a)\nINPUT(b)\nINPUT(c)\nINPUT(d)\nOUTPUT(y)\n"
+      "t = NAND(a, b)\nu = NOR(c, d)\ny = XOR(t, u)\n");
+  const auto c = rith::compute_cop(nl);
+  std::vector<rith::Word> pi(4, 0);
+  for (int p = 0; p < 16; ++p)
+    for (int i = 0; i < 4; ++i)
+      if (p >> i & 1) pi[i] |= rith::Word{1} << p;
+  const auto v = rith::simulate(nl, pi, {});
+  const rith::Word m = 0xFFFF;
+  for (rith::GateId g = 0; g < nl.size(); ++g) {
+    const double exact = std::popcount(v[g] & m) / 16.0;
+    CHECK(std::abs(c.p1[g] - exact) < 1e-12);
+  }
+  CHECK(std::abs(c.p1[nl.find("t")] - 0.75) < 1e-12);
+  CHECK(std::abs(c.obs[nl.find("y")] - 1.0) < 1e-12);
+  CHECK(std::abs(c.obs[nl.find("a")] - 0.5) < 1e-12);  // needs b = 1
+  // Stem fault detection probability vs fault simulation over all 16 patterns.
+  rith::FaultSimulator sim(nl, rith::build_fault_list(nl, false));
+  sim.simulate_block(pi, {}, 0);
+  for (const auto& f : sim.fault_list().faults) {
+    if (f.pin != rith::Fault::kOutputPin) continue;
+    const double exact = std::popcount(sim.detect_mask(f) & m) / 16.0;
+    const double cop = f.stuck_at_one ? c.detect_sa1(f.gate) : c.detect_sa0(f.gate);
+    CHECK(std::abs(cop - exact) < 1e-12);
+  }
 }
 
 }  // namespace

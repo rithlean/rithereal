@@ -21,7 +21,12 @@ Format format_of(const std::string& path) {
 Netlist read_netlist_file(const std::string& path, const Library* lib) {
   std::ifstream in(path);
   if (!in) throw std::runtime_error("cannot open '" + path + "'");
-  return format_of(path) == Format::Bench ? read_bench(in, path) : read_verilog(in, path, lib);
+  if (format_of(path) == Format::Verilog) return read_verilog(in, path, lib);
+  Netlist nl = read_bench(in, path);
+  // BENCH has no design name; use the file name without directory or extension.
+  auto base = path.substr(path.find_last_of("/\\") == std::string::npos ? 0 : path.find_last_of("/\\") + 1);
+  nl.name = base.substr(0, base.rfind('.'));
+  return nl;
 }
 
 void write_netlist_file(const std::string& path, const Netlist& nl) {

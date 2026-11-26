@@ -1,42 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "rith/sim.hpp"
 
+#include "rith/eval.hpp"
+
 #include <random>
 #include <unordered_map>
 
 namespace rith {
 
-namespace {
-Word eval(GateType t, std::span<const GateId> fi, const std::vector<Word>& v) {
-  switch (t) {
-    case GateType::Buf: return v[fi[0]];
-    case GateType::Not: return ~v[fi[0]];
-    case GateType::And:
-    case GateType::Nand: {
-      Word r = ~Word{0};
-      for (GateId f : fi) r &= v[f];
-      return t == GateType::And ? r : ~r;
-    }
-    case GateType::Or:
-    case GateType::Nor: {
-      Word r = 0;
-      for (GateId f : fi) r |= v[f];
-      return t == GateType::Or ? r : ~r;
-    }
-    case GateType::Xor:
-    case GateType::Xnor: {
-      Word r = 0;
-      for (GateId f : fi) r ^= v[f];
-      return t == GateType::Xor ? r : ~r;
-    }
-    case GateType::Mux2: {
-      const Word s = v[fi[0]];
-      return (~s & v[fi[1]]) | (s & v[fi[2]]);
-    }
-    default: return 0;
-  }
-}
-}  // namespace
 
 std::vector<Word> simulate(const Netlist& nl, std::span<const Word> pi_words,
                            std::span<const Word> state_words) {
@@ -48,8 +19,9 @@ std::vector<Word> simulate(const Netlist& nl, std::span<const Word> pi_words,
   for (std::size_t i = 0; i < state_words.size(); ++i) v[nl.flops()[i]] = state_words[i];
   for (GateId g : nl.topo_order()) {
     const GateType t = nl.gate(g).type;
-    if (t == GateType::Const1) v[g] = ~Word{0};
-    else if (!is_source(t)) v[g] = eval(t, nl.fanins(g), v);
+    if (t == GateType::Input || t == GateType::Dff) continue;
+    const auto fi = nl.fanins(g);
+    v[g] = eval_gate(t, fi.size(), [&](std::size_t i) { return v[fi[i]]; });
   }
   return v;
 }

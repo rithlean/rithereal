@@ -18,8 +18,12 @@ add_library(rith_core
   src/bench.cpp
   src/verilog.cpp
   src/file_io.cpp
-  src/liberty.cpp)
+  src/liberty.cpp
+  src/fault.cpp
+  src/testability.cpp)
 target_include_directories(rith_core PUBLIC include)
+find_package(Threads REQUIRED)
+target_link_libraries(rith_core PUBLIC Threads::Threads)
 if(MSVC)
   target_compile_options(rith_core PRIVATE /W4)
 else()

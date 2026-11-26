@@ -7,11 +7,10 @@
 #include <string>
 #include <vector>
 
+#include "rith/eval.hpp"
 #include "rith/netlist.hpp"
 
 namespace rith {
-
-using Word = std::uint64_t;
 
 // Simulates one block of 64 patterns over the combinational (full-scan) view.
 // pi_words[i] drives netlist.inputs()[i]; state_words[i] drives netlist.flops()[i].

@@ -19,6 +19,7 @@ no DFT logic of its own.
 | `testability <netlist>` | hardest nets by SCOAP/COP | `compute_scoap`, `compute_cop` |
 | `scan <netlist.v> -o out.v` | scan insertion | `insert_scan`, `verify_mission_mode`, `verify_shift`, the writers |
 | `tpi <netlist>` | test point selection and insertion | `select_test_points`, `random_coverage`, `insert_test_points` or `apply_test_points` |
+| `atpg <netlist>` | stuck-at test generation | `run_atpg`, `write_patterns`, or `Podem::generate` with `--trace` |
 
 ## `main()`: dispatch
 
@@ -37,8 +38,9 @@ flowchart TD
   E -->|testability| TE["testability()"]
   E -->|scan| SC["scan()"]
   E -->|tpi| TP["tpi()"]
+  E -->|atpg| AT["atpg()"]
   E -->|anything else| U(["print usage, exit 2"])
-  S & CV & EQ & FS & TE & SC & TP --> R(["exit code from the command"])
+  S & CV & EQ & FS & TE & SC & TP & AT --> R(["exit code from the command"])
   E -.->|"any exception"| X(["print 'error: ...', exit 1"])
 ```
 
@@ -105,6 +107,19 @@ flowchart TD
   H -->|"yes, Netlist mode"| J["apply_test_points; write_netlist_file"]
   I --> Z2(["exit 0 if mission mode unchanged, else 1"])
   J --> Z
+```
+
+## `atpg`
+
+```mermaid
+flowchart TD
+  A(["atpg"]) --> B["load netlist; print reader warnings"]
+  B --> C{"--trace FAULT?"}
+  C -->|yes| D["find the fault by its describe() name;<br/>Podem::generate with trace;<br/>print the steps"] --> Z0(["exit 0"])
+  C -->|no| E["AtpgConfig: --backtracks (1000), --random (4096),<br/>--seed, --no-compact"]
+  E --> F["run_atpg; print faults, detected, redundant, aborted,<br/>coverage, efficiency, patterns, time"]
+  F --> G["--show-aborted N lists aborted faults;<br/>-o writes the patterns"]
+  G --> Z(["exit 0, or 1 if run_atpg reported an internal error"])
 ```
 
 In Design mode points are only allowed on nets that exist in the Verilog, not on the

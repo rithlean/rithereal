@@ -4,10 +4,11 @@ Open-source design-for-test (DFT) tools in C++: scan insertion, ML-guided test p
 insertion, fault simulation and ATPG for gate-level netlists from Design Compiler,
 Genus or Yosys, with IEEE-standard outputs for Tessent, TestMAX, Modus and OpenROAD.
 
-**Status: Phase 3a (classic test point insertion).** The netlist core, readers and
-writers, a multi-threaded stuck-at fault simulator, SCOAP/COP testability analysis, mux-D
-scan insertion and test point insertion on library-mapped netlists work today. The
-ML-guided test point selector (Phase 3b) is next.
+**Status: Phase 4 (ATPG), first step.** The netlist core, readers and writers, a
+multi-threaded stuck-at fault simulator, SCOAP/COP testability analysis, mux-D scan
+insertion, test point insertion and PODEM test generation work today. Next: SOCRATES-style
+learning and a SAT fallback, so hard faults are proved redundant instead of aborted, then
+STIL patterns. The ML-guided test point selector (Phase 3b) is deferred.
 
 ## Build
 
@@ -101,6 +102,47 @@ point would not help):
 | s38417 | 32 | 95.97% | 97.42% | 4.5 s |
 | s38584 | 32 | 94.95% | 97.20% | 3.8 s |
 
+### Test generation (ATPG)
+
+```sh
+build/rith atpg design.bench -o patterns.txt          # random patterns, then PODEM, then compaction
+build/rith atpg design.bench --trace "n12 SA0"        # every PODEM step for one fault
+```
+
+- Random patterns go first and are kept only when they are the first to detect a fault.
+  PODEM (Goel, 1981) then targets each fault still undetected: decisions only on inputs and
+  scan cells, three-valued good and faulty machine implication, SCOAP-guided backtrace,
+  D-frontier with an X-path check. Each fault ends **detected**, **redundant** (the search
+  was exhausted, which proves no test exists) or **aborted** (backtrack limit, default 1000).
+- Every PODEM pattern is fault-simulated and must detect its target, and the final set is
+  compacted by reverse-order fault simulation.
+- Correctness is checked against brute force: on every fault of c17, s27 and 150 random
+  circuits with every gate type, PODEM with no backtrack limit must say detected exactly
+  when some input assignment detects the fault, and its test cube must detect it whatever
+  the don't-cares are set to. The choices the paper leaves open are listed in
+  `include/rith/atpg.hpp`.
+- Plain PODEM cannot prove some redundancies in reasonable time. The redundant faults of
+  c432, c499 and c1355 stay aborted even at 100,000 backtracks; learning (SOCRATES) and SAT
+  are the next steps for that.
+
+Uncollapsed coverage and efficiency (detected plus proved redundant, over all faults),
+backtrack limit 1000, 4 threads:
+
+| Circuit | Faults (collapsed) | Redundant | Aborted | Coverage | Efficiency | Patterns | Time |
+|---|---|---|---|---|---|---|---|
+| c432 | 524 | 0 | 4 | 98.84% | 98.84% | 55 | 0.01 s |
+| c2670 | 2,747 | 68 | 49 | 96.40% | 98.22% | 131 | 0.2 s |
+| c6288 | 7,744 | 32 | 2 | 99.46% | 99.97% | 36 | 0.2 s |
+| c7552 | 7,550 | 62 | 79 | 98.48% | 99.12% | 272 | 0.8 s |
+| s9234 | 6,927 | 222 | 230 | 93.95% | 96.51% | 461 | 2.4 s |
+| s15850 | 11,725 | 385 | 4 | 97.51% | 99.94% | 482 | 0.6 s |
+| s35932 | 38,454 | 3,984 | 0 | 89.60% | 100.00% | 72 | 7.2 s |
+| s38417 | 31,180 | 109 | 62 | 99.67% | 99.91% | 1,060 | 1.0 s |
+| s38584 | 36,303 | 1,504 | 2 | 95.57% | 100.00% | 784 | 1.5 s |
+| b14 | 22,698 | 63 | 101 | 99.33% | 99.59% | 1,151 | 7.5 s |
+| b17 | 76,491 | 413 | 2,331 | 96.60% | 97.13% | 2,845 | 128 s |
+| b19 | 533,276 | 1,526 | 6,525 | 98.55% | 98.87% | 19,423 | 562 s |
+
 ## What is supported now
 
 | Area | Supported | Not yet |
@@ -111,7 +153,8 @@ point would not help):
 | Core | Flat gate graph, CSR fanin/fanout, levelization, loop and driver checks | |
 | Simulation | 64-pattern bit-parallel, full-scan view | |
 | Faults | Single stuck-at on stems and fanout branches; equivalence collapsing; faults in unobservable logic counted separately | Transition faults, dominance collapsing |
-| Fault simulation | Parallel-pattern single-fault propagation, event-driven, fault dropping, multi-threaded; checked against brute force | Deterministic ATPG patterns (Phase 4) |
+| Fault simulation | Parallel-pattern single-fault propagation, event-driven, fault dropping, multi-threaded; checked against brute force | |
+| ATPG | Stuck-at, full scan: random phase, PODEM with SCOAP backtrace and X-path check, redundancy proofs, reverse-order compaction, plain-text patterns, decision trace | Learning (SOCRATES), SAT fallback, STIL patterns, transition faults, sequential ATPG |
 | Testability | SCOAP CC0/CC1/CO and COP probability/observability, full-scan view | |
 | Test points | Observe, control-0, control-1; greedy COP selection re-aimed by fault simulation; insertion with library cells, mission-mode check | ML-guided selection (Phase 3b), timing-aware placement of points |
 | Scan insertion | Mux-D scan on library cells; function-based scan cell matching; clock-domain and edge grouping; balanced chains; restitching existing scan cells; DEF SCANCHAINS, STIL, Tessent outputs; mission-mode and shift checks | Lockup latches for mixed-clock chains, test-mode control of gated clocks and async set/reset, LSSD and clocked scan, compression |
@@ -122,7 +165,7 @@ a 50k-gate random circuit (133k collapsed faults, 4,096 patterns) takes about 6 
 ## Layout
 
 ```
-include/rith/   public headers (netlist, eval, sim, io, design, liberty, fault, testability, scan, tpi)
+include/rith/   public headers (netlist, eval, sim, io, design, liberty, fault, testability, scan, tpi, atpg)
 src/            library sources
 tools/          the `rith` command
 tests/          tests and test netlists (ISCAS c17, s27, Yosys-style sample)
@@ -133,9 +176,10 @@ tests/          tests and test netlists (ISCAS c17, s27, Yosys-style sample)
 1. **Phase 0, foundations (done):** netlist core, BENCH/Verilog I/O, Liberty cell mapping for DC/Genus netlists.
 2. **Phase 1 (done):** stuck-at fault list, bit-parallel fault simulator, SCOAP/COP.
 3. **Phase 2 (done):** scan insertion and stitching; DEF `SCANCHAINS`, STIL and Tessent outputs.
-4. **Phase 3:** test point insertion. 3a (now): the classic COP and fault-sim guided baseline.
-   3b: a graph neural network trained on fault-simulation labels, measured against 3a. Release v0.1.
-5. **Phase 4:** PODEM ATPG, compaction, STIL patterns, transition faults. Release v1.0.
+4. **Phase 3:** test point insertion. 3a (done): the classic COP and fault-sim guided baseline.
+   3b (deferred): a graph neural network trained on fault-simulation labels, measured against 3a.
+5. **Phase 4 (now):** ATPG. PODEM (done), then SOCRATES learning, SAT fallback, STIL patterns,
+   transition faults. Release v1.0.
 
 ## License
 

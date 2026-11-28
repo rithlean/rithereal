@@ -11,6 +11,7 @@
 #include "rith/design.hpp"
 #include "rith/io.hpp"
 #include "rith/scan.hpp"
+#include "rith/atpg.hpp"
 #include "rith/tpi.hpp"
 #include "rith/fault.hpp"
 #include "rith/sim.hpp"
@@ -36,6 +37,9 @@ constexpr const char* kUsage =
     "  rith [--lib cells.lib ...] tpi <netlist> [--points K] [--patterns N] [--seed S]\n"
     "        [--observe-only | --control-only] [--cop-only] [-o out] [--enable tp_en] [--clock CK]\n"
     "                                                      test point insertion (greedy, COP + fault sim)\n"
+    "  rith [--lib cells.lib ...] atpg <netlist> [--backtracks N] [--random N] [--seed S] [--no-compact]\n"
+    "        [-o patterns.txt] [--show-aborted N] [--trace FAULT]\n"
+    "                                                      stuck-at test generation (random + PODEM)\n"
     "\n"
     "Formats are chosen by extension: .bench, .v. Use --lib (repeatable) for netlists\n"
     "mapped to a cell library, such as Design Compiler or Genus output.\n";
@@ -307,6 +311,60 @@ int tpi(const std::vector<std::string>& args) {
   return 0;
 }
 
+int atpg(const std::vector<std::string>& args) {
+  const auto nl = load(args[1]);
+  for (const auto& w : nl.warnings) std::cerr << "warning: " << args[1] << ": " << w << "\n";
+  if (const auto t = text_option(args, "--trace", ""); !t.empty()) {
+    // Trace PODEM on one fault, named as `describe` prints it, e.g. "n12 SA0".
+    const auto fl = rith::build_fault_list(nl, false);
+    for (const auto& f : fl.faults)
+      if (rith::describe(nl, f) == t) {
+        rith::Podem podem(nl);
+        rith::PodemConfig pc;
+        pc.trace = true;
+        pc.backtrack_limit = option(args, "--backtracks", 1000);
+        const auto r = podem.generate(f, pc);
+        for (const auto& line : r.trace) std::cout << line << "\n";
+        std::printf("%zu decisions, %zu backtracks\n", r.decisions, r.backtracks);
+        return 0;
+      }
+    throw std::runtime_error("no fault named '" + t + "' (use the form 'net SA0' or 'net -> gate.inK SA1')");
+  }
+  rith::AtpgConfig cfg;
+  cfg.backtrack_limit = option(args, "--backtracks", cfg.backtrack_limit);
+  cfg.random_patterns = option(args, "--random", cfg.random_patterns);
+  cfg.seed = option(args, "--seed", 1);
+  cfg.compact = !flag(args, "--no-compact");
+  const std::size_t show = option(args, "--show-aborted", 0);
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto r = rith::run_atpg(nl, cfg);
+  const double secs = seconds_since(t0);
+  std::printf("design        %s (%zu gates, %zu inputs, %zu scan cells)\n", nl.name.c_str(), nl.size(),
+              nl.inputs().size(), nl.flops().size());
+  std::printf("faults        %zu collapsed, %zu uncollapsed\n", r.faults, r.uncollapsed);
+  std::printf("detected      %zu\n", r.detected);
+  std::printf("redundant     %zu (proved untestable)\n", r.redundant);
+  std::printf("aborted       %zu (backtrack limit %zu)\n", r.aborted, cfg.backtrack_limit);
+  std::printf("coverage      %.2f%% fault coverage, %.2f%% fault efficiency (uncollapsed)\n", 100 * r.coverage(),
+              100 * r.efficiency());
+  std::printf("patterns      %zu (%zu random and %zu PODEM before compaction)\n", r.patterns.size(),
+              r.random_patterns_kept, r.deterministic_patterns);
+  std::printf("backtracks    %zu\n", r.backtracks);
+  std::printf("time          %.2f s\n", secs);
+  for (const auto& e : r.errors) std::fprintf(stderr, "internal error: %s\n", e.c_str());
+  std::size_t shown = 0;
+  for (std::size_t i = 0; i < r.faults && shown < show; ++i)
+    if (r.status[i] == rith::AtpgOutcome::Aborted) {
+      if (!shown++) std::printf("aborted:\n");
+      std::printf("  %s\n", rith::describe(nl, r.fault_list.faults[i]).c_str());
+    }
+  if (const auto out = text_option(args, "-o", ""); !out.empty()) {
+    write_file(out, [&](std::ostream& o) { rith::write_patterns(o, nl, r.patterns); });
+    std::cout << "wrote " << out << "\n";
+  }
+  return r.errors.empty() ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -326,6 +384,7 @@ int main(int argc, char** argv) {
     if (args.size() >= 2 && args[0] == "testability") return testability(args);
     if (args.size() >= 2 && args[0] == "scan") return scan(args);
     if (args.size() >= 2 && args[0] == "tpi") return tpi(args);
+    if (args.size() >= 2 && args[0] == "atpg") return atpg(args);
     std::cerr << kUsage;
     return 2;
   } catch (const std::exception& e) {

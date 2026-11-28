@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <ostream>
 #include <random>
+#include <span>
 #include <stdexcept>
 
 #include "rith/eval.hpp"
@@ -80,6 +81,159 @@ const char* vname(std::uint8_t v) { return v == k0 ? "0" : v == k1 ? "1" : "X"; 
 
 }  // namespace
 
+
+// ---------------------------------------------------------------------------
+// Necessary assignments: direct implications (forward and backward), learned
+// implications, and conflict detection. Values are for the good machine.
+//
+// `closure` starts from literals that every test must satisfy and adds what
+// they force. Each step is a sound deduction, so a conflict proves that no
+// test exists under the current assignment; stopping early at `cap` only means
+// fewer conclusions.
+struct Lit {
+  GateId net;
+  std::uint8_t val;
+};
+
+class Implicator {
+ public:
+  explicit Implicator(const Netlist& nl) : nl_(nl), req_(nl.size(), kX), learned(2 * nl.size()) {}
+
+  // learned[2 * n + v]: literals that n = v forces, found by static learning.
+  const Netlist& nl_;
+  std::vector<std::uint8_t> req_;
+  std::vector<std::vector<Lit>> learned;
+  std::size_t learned_count = 0;
+
+  // known(n) gives the value already fixed by simulation (kX if open).
+  template <class Known>
+  bool closure(std::span<const Lit> seeds, Known&& known, std::size_t cap, std::vector<Lit>* out) {
+    conflict_ = false;
+    steps_ = 0;
+    cap_ = cap;
+    queue_.clear();
+    auto val = [&](GateId x) { return req_[x] != kX ? req_[x] : known(x); };
+    auto set = [&](GateId x, std::uint8_t v) {
+      if (conflict_) return;
+      const std::uint8_t cur = val(x);
+      if (cur == v) return;
+      if (cur != kX) { conflict_ = true; return; }
+      req_[x] = v;
+      touched_.push_back(x);
+      if (++steps_ <= cap_) queue_.push_back(x);
+    };
+    auto backward = [&](GateId x) {
+      const GateType t = nl_.gate(x).type;
+      if (is_source(t) || t == GateType::Const0 || t == GateType::Const1) return;
+      const auto fi = nl_.fanins(x);
+      const std::uint8_t v = val(x);
+      if (v == kX) return;
+      const std::uint8_t r = eval3(t, fi.size(), [&](std::size_t i) { return val(fi[i]); });
+      if (r != kX && r != v) { conflict_ = true; return; }
+      switch (t) {
+        case GateType::Buf: set(fi[0], v); break;
+        case GateType::Not: set(fi[0], v_not(v)); break;
+        case GateType::And:
+        case GateType::Nand:
+        case GateType::Or:
+        case GateType::Nor: {
+          const bool and_like = t == GateType::And || t == GateType::Nand;
+          const std::uint8_t core = (t == GateType::Nand || t == GateType::Nor) ? v_not(v) : v;
+          const std::uint8_t ctrl = and_like ? k0 : k1, nc = v_not(ctrl);
+          if (core == nc) {  // output not controlled: every input non-controlling
+            for (GateId i : fi) set(i, nc);
+          } else {  // some input must be controlling; if only one can be, it is
+            GateId open = kNoGate;
+            std::size_t n_open = 0;
+            for (GateId i : fi) {
+              const auto vi = val(i);
+              if (vi == ctrl) return;  // already satisfied
+              if (vi == kX) { open = i; ++n_open; }
+            }
+            if (n_open == 1) set(open, ctrl);
+          }
+          break;
+        }
+        case GateType::Xor:
+        case GateType::Xnor: {
+          GateId open = kNoGate;
+          std::size_t n_open = 0;
+          std::uint8_t parity = t == GateType::Xnor ? 1 : 0;
+          for (GateId i : fi) {
+            const auto vi = val(i);
+            if (vi == kX) { open = i; ++n_open; } else parity ^= vi;
+          }
+          if (n_open == 1) set(open, std::uint8_t(v ^ parity));
+          break;
+        }
+        case GateType::Mux2: {
+          const auto sv = val(fi[0]);
+          if (sv != kX) { set(fi[sv == k0 ? 1 : 2], v); break; }
+          if (val(fi[1]) == v_not(v)) set(fi[0], k1);
+          if (val(fi[2]) == v_not(v)) set(fi[0], k0);
+          break;
+        }
+        default: break;
+      }
+    };
+    for (const Lit& l : seeds) set(l.net, l.val);
+    for (std::size_t q = 0; q < queue_.size() && !conflict_; ++q) {
+      const GateId x = queue_[q];
+      const std::uint8_t v = req_[x];
+      for (const Lit& l : learned[2 * x + v]) set(l.net, l.val);
+      backward(x);
+      for (GateId o : nl_.fanouts(x)) {
+        if (conflict_) break;
+        const GateType t = nl_.gate(o).type;
+        if (is_source(t)) continue;
+        const auto fo = nl_.fanins(o);
+        const std::uint8_t r = eval3(t, fo.size(), [&](std::size_t i) { return val(fo[i]); });
+        if (r != kX) set(o, r);
+        if (!conflict_ && val(o) != kX) backward(o);
+      }
+    }
+    if (out) {
+      out->clear();
+      for (GateId x : touched_) out->push_back({x, req_[x]});
+    }
+    for (GateId x : touched_) req_[x] = kX;
+    touched_.clear();
+    return !conflict_;
+  }
+
+  // SOCRATES static learning (Schulz, Trischler and Sarfert, 1988): for each
+  // net n and value v, find what n = v implies; when it implies m = w and the
+  // opposite value at m says nothing by direct implication (an AND output 0,
+  // an OR output 1, ...), record the contrapositive m = !w  =>  n = !v.
+  void learn(const std::vector<std::uint8_t>& base, std::size_t cap, std::size_t max_total) {
+    std::vector<Lit> implied;
+    const Lit* seed = nullptr;
+    for (GateId x = 0; x < nl_.size(); ++x) {
+      const GateType tx = nl_.gate(x).type;
+      if (tx == GateType::Const0 || tx == GateType::Const1 || base[x] != kX) continue;
+      for (std::uint8_t v : {k0, k1}) {
+        const Lit l{x, v};
+        seed = &l;
+        if (!closure(std::span<const Lit>(seed, 1), [&](GateId n) { return base[n]; }, cap, &implied)) continue;
+        for (const Lit& m : implied) {
+          if (m.net == x) continue;
+          const GateType t = nl_.gate(m.net).type;
+          const bool useful = (t == GateType::And && m.val == k1) || (t == GateType::Nand && m.val == k0) ||
+                              (t == GateType::Or && m.val == k0) || (t == GateType::Nor && m.val == k1);
+          if (!useful) continue;
+          learned[2 * m.net + v_not(m.val)].push_back({x, v_not(v)});
+          if (++learned_count >= max_total) return;
+        }
+      }
+    }
+  }
+
+ private:
+  bool conflict_ = false;
+  std::size_t steps_ = 0, cap_ = 0;
+  std::vector<GateId> queue_, touched_;
+};
+
 struct Podem::Impl {
   const Netlist& nl;
   Scoap scoap;
@@ -100,8 +254,17 @@ struct Podem::Impl {
   std::vector<std::uint32_t> stamp;
   std::uint32_t stamp_now = 0;
   std::vector<std::string>* trace = nullptr;
+  // SOCRATES-style additions.
+  Implicator imp;
+  std::vector<GateId> ipdom;      // immediate post-dominator toward the outputs; kSink, or kNoGate if dead
+  std::vector<std::uint32_t> pos; // position in topo order (kSink is last)
+  GateId kSink = 0;
+  bool use_us = true;             // unique sensitization and learned implications this run
+  std::vector<Lit> sreq;          // necessary assignments for the current fault
+  std::vector<Lit> scratch_lits, seeds;
+  std::size_t closure_cap = 2000;
 
-  explicit Impl(const Netlist& n) : nl(n), scoap(compute_scoap(n)) {
+  Impl(const Netlist& n, bool learning) : nl(n), scoap(compute_scoap(n)), imp(n) {
     const std::size_t N = nl.size();
     source_index.assign(N, SIZE_MAX);
     for (GateId i : nl.inputs()) { source_index[i] = sources.size(); sources.push_back(i); }
@@ -121,6 +284,50 @@ struct Podem::Impl {
     queued.assign(N, 0);
     in_cone.assign(N, 0);
     stamp.assign(N, 0);
+    // Post-dominators (Cooper, Harvey and Kennedy's intersection) on the graph of
+    // gates plus a sink that every observed net feeds.
+    kSink = static_cast<GateId>(N);
+    pos.assign(N + 1, 0);
+    const auto& topo = nl.topo_order();
+    for (std::size_t i = 0; i < topo.size(); ++i) pos[topo[i]] = static_cast<std::uint32_t>(i);
+    pos[kSink] = static_cast<std::uint32_t>(N);
+    ipdom.assign(N + 1, kNoGate);
+    ipdom[kSink] = kSink;
+    for (std::size_t i = topo.size(); i-- > 0;) {
+      const GateId x = topo[i];
+      GateId d = is_obs[x] ? kSink : kNoGate;
+      for (GateId o : nl.fanouts(x)) {
+        if (is_source(nl.gate(o).type) || ipdom[o] == kNoGate) continue;
+        d = d == kNoGate ? o : intersect(d, o);
+      }
+      ipdom[x] = d;
+    }
+    if (learning) imp.learn(base, 1000, 8 * N + 1024);  // per-literal implication cap, total cap
+  }
+
+  GateId intersect(GateId a, GateId b) const {
+    while (a != b) {
+      while (pos[a] < pos[b]) a = ipdom[a];
+      while (pos[b] < pos[a]) b = ipdom[b];
+    }
+    return a;
+  }
+
+  // Side inputs of a gate the fault effect must pass through: those that cannot
+  // carry the effect must hold the non-controlling value. Returns false if one
+  // already holds the controlling value.
+  bool mandatory_sides(GateId d, std::vector<Lit>& out) const {
+    const GateType t = nl.gate(d).type;
+    if (t != GateType::And && t != GateType::Nand && t != GateType::Or && t != GateType::Nor) return true;
+    const std::uint8_t nc = (t == GateType::And || t == GateType::Nand) ? k1 : k0;
+    const auto fi = nl.fanins(d);
+    for (std::size_t i = 0; i < fi.size(); ++i) {
+      if (fault.pin >= 0 && fault.gate == d && static_cast<std::size_t>(fault.pin) == i) continue;
+      if (in_cone[fi[i]]) continue;  // may carry the effect
+      if (g[fi[i]] == v_not(nc)) return false;
+      if (g[fi[i]] == kX) out.push_back({fi[i], nc});
+    }
+    return true;
   }
 
   // Faulty-machine value on pin i of gate gid (the fault may sit on that pin).
@@ -206,6 +413,39 @@ struct Podem::Impl {
     }
   }
 
+  // Necessary assignments of the fault before any decision: excite it, and
+  // sensitize every gate all its paths to an output go through (static unique
+  // sensitization). False means the fault is redundant.
+  bool static_requirements() {
+    sreq.clear();
+    if (!use_us) return true;
+    seeds.clear();
+    seeds.push_back({site, v_not(stuck)});
+    const bool dff_pin = fault.pin >= 0 && nl.gate(fault.gate).type == GateType::Dff;
+    if (!dff_pin) {
+      GateId d = fault.pin >= 0 ? fault.gate : ipdom[fault.gate];
+      if (d == kNoGate) return false;  // the effect can reach no output
+      for (; d != kSink; d = ipdom[d])
+        if (!mandatory_sides(d, seeds)) return false;
+    }
+    return imp.closure(seeds, [&](GateId n) { return g[n]; }, closure_cap, &sreq);
+  }
+
+  // Dynamic unique sensitization: gates every path from the current D-frontier
+  // goes through, their side inputs, and what those force. False on a conflict.
+  bool dynamic_requirements(const std::vector<GateId>& live, std::vector<Lit>& must) {
+    must.clear();
+    if (!use_us || live.empty()) return true;
+    GateId d = live[0];
+    for (std::size_t i = 1; i < live.size(); ++i) d = intersect(d, live[i]);
+    seeds.clear();
+    for (; d != kSink && d != kNoGate; d = ipdom[d])
+      if (!mandatory_sides(d, seeds)) return false;
+    if (seeds.empty()) return true;
+    must = seeds;
+    return imp.closure(seeds, [&](GateId n) { return g[n]; }, closure_cap, nullptr);
+  }
+
   bool detected() const {
     if (fault.pin >= 0 && nl.gate(fault.gate).type == GateType::Dff)  // a flop D pin is observed itself
       return g[site] != kX && g[site] != stuck;
@@ -246,24 +486,45 @@ struct Podem::Impl {
     return false;
   }
 
+  std::vector<GateId> live_;
+  std::vector<Lit> must_;
+
   std::uint32_t cc(GateId n, std::uint8_t v) const { return v == k1 ? scoap.cc1[n] : scoap.cc0[n]; }
 
   // An objective (net, value) that moves the test forward, or false when the
   // test is no longer possible from here.
   bool objective(GateId& net, std::uint8_t& val, std::vector<GateId>& frontier) {
     if (g[site] == stuck) return false;  // the fault can no longer be excited
+    // A necessary assignment already contradicted: no test below this point.
+    for (const Lit& l : sreq)
+      if (g[l.net] != kX && g[l.net] != l.val) return false;
     if (g[site] == kX) {
       net = site;
       val = v_not(stuck);
       return true;
     }
     d_frontier(frontier);
+    live_.clear();
     GateId best = kNoGate;
     for (GateId h : frontier) {
       if (!x_path(h)) continue;
+      live_.push_back(h);
       if (best == kNoGate || scoap.co[h] < scoap.co[best] || (scoap.co[h] == scoap.co[best] && h < best)) best = h;
     }
     if (best == kNoGate) return false;
+    if (!dynamic_requirements(live_, must_)) return false;
+    // Necessary assignments first, the hardest first (fail early).
+    {
+      GateId pick = kNoGate;
+      std::uint8_t pv = kX;
+      auto consider = [&](const Lit& l) {
+        if (g[l.net] != kX) return;
+        if (pick == kNoGate || cc(l.net, l.val) > cc(pick, pv)) { pick = l.net; pv = l.val; }
+      };
+      for (const Lit& l : sreq) consider(l);
+      for (const Lit& l : must_) consider(l);
+      if (pick != kNoGate) { net = pick; val = pv; return true; }
+    }
     const GateType t = nl.gate(best).type;
     const auto fi = nl.fanins(best);
     auto open = [&](std::size_t i) { return g[fi[i]] == kX || fpin(best, i) == kX; };
@@ -392,7 +653,14 @@ struct Podem::Impl {
   PodemResult run(const Fault& flt, const PodemConfig& cfg) {
     PodemResult r;
     trace = cfg.trace ? &r.trace : nullptr;
+    use_us = cfg.learning;
     setup(flt);
+    if (!static_requirements()) {
+      r.outcome = AtpgOutcome::Redundant;
+      if (trace) trace->push_back("fault " + describe(nl, flt));
+      if (trace) trace->push_back("necessary assignments conflict: redundant");
+      return r;
+    }
     struct Decision {
       GateId src;
       std::uint8_t val;
@@ -446,8 +714,19 @@ struct Podem::Impl {
   }
 };
 
-Podem::Podem(const Netlist& nl) : nl_(nl), impl_(std::make_shared<Impl>(nl)) {
+Podem::Podem(const Netlist& nl, bool learning) : nl_(nl) {
   if (!nl.finalized()) throw NetlistError("Podem requires a finalized netlist");
+  impl_ = std::make_shared<Impl>(nl, learning);
+}
+
+std::size_t Podem::learned() const { return impl_->imp.learned_count; }
+
+std::vector<LearnedImplication> Podem::learned_implications() const {
+  std::vector<LearnedImplication> v;
+  for (GateId n = 0; n < nl_.size(); ++n)
+    for (std::uint8_t b : {k0, k1})
+      for (const Lit& l : impl_->imp.learned[2 * n + b]) v.push_back({n, b == k1, l.net, l.val == k1});
+  return v;
 }
 
 PodemResult Podem::generate(const Fault& f, const PodemConfig& cfg) { return impl_->run(f, cfg); }
@@ -520,9 +799,11 @@ AtpgResult run_atpg(const Netlist& nl, const AtpgConfig& cfg) {
 
   // 2. PODEM for every fault still undetected. Patterns are fault-simulated in
   // blocks of 64, and each must detect the fault it was generated for.
-  Podem podem(nl);
+  Podem podem(nl, cfg.learning);
+  res.learned = podem.learned();
   PodemConfig pc;
   pc.backtrack_limit = cfg.backtrack_limit;
+  pc.learning = cfg.learning;
   std::vector<TestCube> pending;
   std::vector<std::size_t> targets;
   auto flush = [&] {

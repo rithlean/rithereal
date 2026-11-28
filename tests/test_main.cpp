@@ -887,17 +887,19 @@ bool cube_detects(const rith::Netlist& nl, const rith::Fault& f, const rith::Tes
 void check_podem_against_brute_force(const rith::Netlist& nl, const char* what) {
   const auto fl = rith::build_fault_list(nl, false);
   const auto testable = brute_force_testable(nl, fl);
-  rith::Podem podem(nl);
+  for (bool learning : {false, true}) {
+  rith::Podem podem(nl, learning);
   rith::PodemConfig cfg;
   cfg.backtrack_limit = 0;  // complete search: never abort
+  cfg.learning = learning;
   for (std::size_t i = 0; i < fl.faults.size(); ++i) {
     const auto r = podem.generate(fl.faults[i], cfg);
     const bool ok = testable[i] ? r.outcome == rith::AtpgOutcome::Detected : r.outcome == rith::AtpgOutcome::Redundant;
     CHECK(ok);
     if (!ok) {
       std::cerr << "  " << what << ": " << rith::describe(nl, fl.faults[i]) << " is "
-                << (testable[i] ? "testable" : "untestable") << " but PODEM says " << rith::to_string(r.outcome)
-                << "\n";
+                << (testable[i] ? "testable" : "untestable") << " but PODEM" << (learning ? " with learning" : "")
+                << " says " << rith::to_string(r.outcome) << "\n";
       return;
     }
     if (r.outcome == rith::AtpgOutcome::Detected) {
@@ -909,6 +911,34 @@ void check_podem_against_brute_force(const rith::Netlist& nl, const char* what) 
           std::cerr << "  " << what << ": cube for " << rith::describe(nl, fl.faults[i]) << " fails\n";
           return;
         }
+      }
+    }
+  }
+  }
+}
+
+// Every learned implication n = v => m = w must hold for every source assignment.
+void check_learned_implications(const rith::Netlist& nl, const char* what) {
+  const rith::Podem podem(nl, true);
+  const auto imps = podem.learned_implications();
+  const std::size_t pis = nl.inputs().size(), nfl = nl.flops().size(), n = pis + nfl;
+  for (std::uint64_t base = 0; base < (std::uint64_t{1} << n); base += 64) {
+    std::vector<rith::Word> pi(pis, 0), st(nfl, 0);
+    for (std::uint64_t k = 0; k < 64 && base + k < (std::uint64_t{1} << n); ++k)
+      for (std::size_t i = 0; i < n; ++i)
+        if ((base + k) >> i & 1) (i < pis ? pi[i] : st[i - pis]) |= rith::Word{1} << k;
+    const auto v = rith::simulate(nl, pi, st);
+    const std::uint64_t left = (std::uint64_t{1} << n) - base;
+    const rith::Word valid = left >= 64 ? rith::kAllOnes : (rith::Word{1} << left) - 1;
+    for (const auto& im : imps) {
+      const rith::Word when = (im.v ? v[im.n] : ~v[im.n]) & valid;
+      const rith::Word holds = im.w ? v[im.m] : ~v[im.m];
+      const bool ok = (when & ~holds) == 0;
+      CHECK(ok);
+      if (!ok) {
+        std::cerr << "  " << what << ": learned " << nl.gate(im.n).name << "=" << im.v << " => " << nl.gate(im.m).name
+                  << "=" << im.w << " is false\n";
+        return;
       }
     }
   }
@@ -935,11 +965,27 @@ TEST(podem_matches_brute_force_on_random_circuits) {
   }
 }
 
+TEST(learned_implications_are_true) {
+  check_learned_implications(load("c17.bench"), "c17");
+  check_learned_implications(load("s27.bench"), "s27");
+  std::size_t total = 0;
+  for (std::uint64_t seed = 1; seed <= 150; ++seed) {
+    const auto nl = small_random_netlist(4 + seed % 6, 20 + seed % 40, seed % 4, seed);
+    total += rith::Podem(nl, true).learned();
+    const std::string what = "random circuit seed " + std::to_string(seed);
+    const int before = g_failures;
+    check_learned_implications(nl, what.c_str());
+    if (g_failures != before) return;
+  }
+  CHECK(total > 100);  // the check is not vacuous
+}
+
 TEST(podem_decides_only_on_inputs_and_traces) {
   const auto nl = load("c17.bench");
-  rith::Podem podem(nl);
+  rith::Podem podem(nl, false);
   rith::PodemConfig cfg;
   cfg.trace = true;
+  cfg.learning = false;
   const auto fl = rith::build_fault_list(nl, false);
   for (const auto& f : fl.faults) {
     const auto r = podem.generate(f, cfg);

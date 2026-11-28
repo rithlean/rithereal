@@ -97,6 +97,58 @@ Goel's rule with [SCOAP](testability.md) controllability:
 | XOR / XNOR | | the easiest input; wanted value adjusted by the parity of the set inputs |
 | MUX | | the select if a data input already has the value, else a data input |
 
+## SOCRATES learning and unique sensitization
+
+Plain PODEM only notices a dead end when simulation shows it. SOCRATES (Schulz,
+Trischler and Sarfert, 1988) adds reasoning about values that **every** test must
+have, called **necessary assignments**, so many dead ends, and many redundant
+faults, are found without searching. `PodemConfig::learning` turns this on (the
+default); `rith atpg --plain` turns it off for comparison.
+
+```mermaid
+flowchart TD
+  L(["Podem(nl, learning = true)"]) --> SL["static learning, once:<br/>for each net n and value v, closure(n = v);<br/>keep contrapositives m = !w => n = !v"]
+  F(["generate(fault)"]) --> SU["static unique sensitization:<br/>site = NOT stuck, plus non-controlling side inputs<br/>of every post-dominator of the fault"]
+  SU --> C1{"closure conflicts?"}
+  C1 -->|yes| RED(["redundant, no search needed"])
+  C1 -->|no| LOOP["PODEM loop"]
+  LOOP --> CHK{"a necessary assignment<br/>contradicted by simulation?"}
+  CHK -->|yes| BT["backtrack"]
+  CHK -->|no| DU["dynamic unique sensitization:<br/>common post-dominators of the live D-frontier;<br/>their side inputs; closure"]
+  DU -->|conflict| BT
+  DU -->|ok| OBJ["objective: an open necessary assignment, hardest first;<br/>else the usual frontier objective"]
+```
+
+### The implication engine (`Implicator::closure`)
+
+Starting from a few required values (good machine), it adds what they force:
+
+| Direction | Rule | Example |
+|---|---|---|
+| backward | an uncontrolled output needs every input non-controlling | AND = 1 needs all inputs 1 |
+| backward | a controlled output with one input left open needs that one controlling | AND = 0, other inputs 1: the last is 0 |
+| backward | XOR with one input open | value from the parity |
+| forward | inputs that fix a gate fix its output | an AND input 0 makes the output 0 |
+| learned | a stored implication fires | m = 0 => n = 1 |
+
+If a net would need both 0 and 1, the required values are inconsistent: no test
+exists below the current decisions. The closure stops after 2000 values; stopping
+early only means fewer conclusions, never a wrong one.
+
+### Post-dominators
+
+A gate *d* post-dominates *x* when every path from *x* to an output or flop input
+goes through *d*. They are computed once per netlist with the
+Cooper-Harvey-Kennedy intersection on the gate graph plus a sink that every observed
+net feeds. If the fault effect must pass *d*, then *d*'s side inputs that the fault
+cannot reach must hold the non-controlling value.
+
+### Checking it
+
+Learning and pruning must never lose a test. The tests run the brute-force
+comparison twice (plain and with learning), and check every learned implication
+against exhaustive simulation of c17, s27 and 150 random circuits.
+
 ## The whole flow (`run_atpg`)
 
 ```mermaid
@@ -141,7 +193,8 @@ detect it whatever the X bits are set to.
 
 ## Known limits
 
-- Plain PODEM cannot prove some redundancies in reasonable time (c432, c499, c1355).
-  Learning (SOCRATES) and a SAT fallback are the planned next steps.
+- Some redundancies need more reasoning than SOCRATES's direct and learned
+  implications, mostly around XOR trees (c432, c499, c1355). A SAT fallback is
+  the planned next step.
 - PODEM runs on one thread; only fault simulation uses several.
 - Patterns are written as plain text; STIL patterns are planned.

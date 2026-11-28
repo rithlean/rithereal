@@ -37,7 +37,7 @@ constexpr const char* kUsage =
     "  rith [--lib cells.lib ...] tpi <netlist> [--points K] [--patterns N] [--seed S]\n"
     "        [--observe-only | --control-only] [--cop-only] [-o out] [--enable tp_en] [--clock CK]\n"
     "                                                      test point insertion (greedy, COP + fault sim)\n"
-    "  rith [--lib cells.lib ...] atpg <netlist> [--backtracks N] [--random N] [--seed S] [--no-compact]\n"
+    "  rith [--lib cells.lib ...] atpg <netlist> [--backtracks N] [--random N] [--seed S] [--no-compact] [--plain]\n"
     "        [-o patterns.txt] [--show-aborted N] [--trace FAULT]\n"
     "                                                      stuck-at test generation (random + PODEM)\n"
     "\n"
@@ -319,9 +319,11 @@ int atpg(const std::vector<std::string>& args) {
     const auto fl = rith::build_fault_list(nl, false);
     for (const auto& f : fl.faults)
       if (rith::describe(nl, f) == t) {
-        rith::Podem podem(nl);
+        const bool learning = !flag(args, "--plain");
+        rith::Podem podem(nl, learning);
         rith::PodemConfig pc;
         pc.trace = true;
+        pc.learning = learning;
         pc.backtrack_limit = option(args, "--backtracks", 1000);
         const auto r = podem.generate(f, pc);
         for (const auto& line : r.trace) std::cout << line << "\n";
@@ -335,6 +337,7 @@ int atpg(const std::vector<std::string>& args) {
   cfg.random_patterns = option(args, "--random", cfg.random_patterns);
   cfg.seed = option(args, "--seed", 1);
   cfg.compact = !flag(args, "--no-compact");
+  cfg.learning = !flag(args, "--plain");
   const std::size_t show = option(args, "--show-aborted", 0);
   const auto t0 = std::chrono::steady_clock::now();
   const auto r = rith::run_atpg(nl, cfg);
@@ -350,6 +353,9 @@ int atpg(const std::vector<std::string>& args) {
   std::printf("patterns      %zu (%zu random and %zu PODEM before compaction)\n", r.patterns.size(),
               r.random_patterns_kept, r.deterministic_patterns);
   std::printf("backtracks    %zu\n", r.backtracks);
+  std::printf("engine        %s\n", cfg.learning ? ("PODEM + SOCRATES learning (" + std::to_string(r.learned) +
+                                                         " learned implications) + unique sensitization").c_str()
+                                                  : "plain PODEM");
   std::printf("time          %.2f s\n", secs);
   for (const auto& e : r.errors) std::fprintf(stderr, "internal error: %s\n", e.c_str());
   std::size_t shown = 0;

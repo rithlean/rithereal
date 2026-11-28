@@ -4,11 +4,11 @@ Open-source design-for-test (DFT) tools in C++: scan insertion, ML-guided test p
 insertion, fault simulation and ATPG for gate-level netlists from Design Compiler,
 Genus or Yosys, with IEEE-standard outputs for Tessent, TestMAX, Modus and OpenROAD.
 
-**Status: Phase 4 (ATPG), first step.** The netlist core, readers and writers, a
+**Status: Phase 4 (ATPG), second step.** The netlist core, readers and writers, a
 multi-threaded stuck-at fault simulator, SCOAP/COP testability analysis, mux-D scan
-insertion, test point insertion and PODEM test generation work today. Next: SOCRATES-style
-learning and a SAT fallback, so hard faults are proved redundant instead of aborted, then
-STIL patterns. The ML-guided test point selector (Phase 3b) is deferred.
+insertion, test point insertion and PODEM test generation with SOCRATES-style learning
+work today. Next: a SAT fallback for the faults that are still aborted, then STIL
+patterns. The ML-guided test point selector (Phase 3b) is deferred.
 
 ## Build
 
@@ -107,6 +107,7 @@ point would not help):
 ```sh
 build/rith atpg design.bench -o patterns.txt          # random patterns, then PODEM, then compaction
 build/rith atpg design.bench --trace "n12 SA0"        # every PODEM step for one fault
+build/rith atpg design.bench --plain                  # plain PODEM, without the SOCRATES additions
 ```
 
 - Random patterns go first and are kept only when they are the first to detect a fault.
@@ -114,6 +115,12 @@ build/rith atpg design.bench --trace "n12 SA0"        # every PODEM step for one
   scan cells, three-valued good and faulty machine implication, SCOAP-guided backtrace,
   D-frontier with an X-path check. Each fault ends **detected**, **redundant** (the search
   was exhausted, which proves no test exists) or **aborted** (backtrack limit, default 1000).
+- On top of PODEM, three ideas from SOCRATES (Schulz, Trischler and Sarfert, 1988) prune the
+  search: **static learning** (contrapositive implications found once per netlist), and
+  **static and dynamic unique sensitization** (the side inputs of every gate the fault
+  effect must pass through need non-controlling values). These necessary assignments are
+  closed under direct and learned implications; a conflict proves the fault redundant
+  without searching, or forces an early backtrack.
 - Every PODEM pattern is fault-simulated and must detect its target, and the final set is
   compacted by reverse-order fault simulation.
 - Correctness is checked against brute force: on every fault of c17, s27 and 150 random
@@ -121,27 +128,27 @@ build/rith atpg design.bench --trace "n12 SA0"        # every PODEM step for one
   when some input assignment detects the fault, and its test cube must detect it whatever
   the don't-cares are set to. The choices the paper leaves open are listed in
   `include/rith/atpg.hpp`.
-- Plain PODEM cannot prove some redundancies in reasonable time. The redundant faults of
-  c432, c499 and c1355 stay aborted even at 100,000 backtracks; learning (SOCRATES) and SAT
-  are the next steps for that.
+- Some redundancies need more than SOCRATES's implications, mostly around XOR trees: the
+  redundant faults of c432, c499 and c1355 stay aborted. A SAT fallback is the next step.
 
-Uncollapsed coverage and efficiency (detected plus proved redundant, over all faults),
-backtrack limit 1000, 4 threads:
+Collapsed faults proved redundant and aborted, plain PODEM against PODEM with the SOCRATES
+additions; efficiency is detected plus proved redundant over all (uncollapsed) faults.
+Backtrack limit 1000, 4 threads:
 
-| Circuit | Faults (collapsed) | Redundant | Aborted | Coverage | Efficiency | Patterns | Time |
+| Circuit | Faults | Plain: redundant / aborted | Efficiency | Time | Learning: redundant / aborted | Efficiency | Time |
 |---|---|---|---|---|---|---|---|
-| c432 | 524 | 0 | 4 | 98.84% | 98.84% | 55 | 0.01 s |
-| c2670 | 2,747 | 68 | 49 | 96.40% | 98.22% | 131 | 0.2 s |
-| c6288 | 7,744 | 32 | 2 | 99.46% | 99.97% | 36 | 0.2 s |
-| c7552 | 7,550 | 62 | 79 | 98.48% | 99.12% | 272 | 0.8 s |
-| s9234 | 6,927 | 222 | 230 | 93.95% | 96.51% | 461 | 2.4 s |
-| s15850 | 11,725 | 385 | 4 | 97.51% | 99.94% | 482 | 0.6 s |
-| s35932 | 38,454 | 3,984 | 0 | 89.60% | 100.00% | 72 | 7.2 s |
-| s38417 | 31,180 | 109 | 62 | 99.67% | 99.91% | 1,060 | 1.0 s |
-| s38584 | 36,303 | 1,504 | 2 | 95.57% | 100.00% | 784 | 1.5 s |
-| b14 | 22,698 | 63 | 101 | 99.33% | 99.59% | 1,151 | 7.5 s |
-| b17 | 76,491 | 413 | 2,331 | 96.60% | 97.13% | 2,845 | 128 s |
-| b19 | 533,276 | 1,526 | 6,525 | 98.55% | 98.87% | 19,423 | 562 s |
+| c1908 | 1,879 | 6 / 3 | 99.87% | 0.02 s | 9 / 0 | 100.00% | 0.02 s |
+| c2670 | 2,747 | 68 / 49 | 98.22% | 0.2 s | 88 / 29 | 98.93% | 0.2 s |
+| c3540 | 3,428 | 84 / 53 | 98.57% | 0.5 s | 137 / 0 | 100.00% | 0.06 s |
+| c7552 | 7,550 | 62 / 79 | 99.12% | 0.8 s | 77 / 56 | 99.27% | 0.5 s |
+| s9234 | 6,927 | 222 / 230 | 96.51% | 2.4 s | 403 / 49 | 99.43% | 1.4 s |
+| s38417 | 31,180 | 109 / 62 | 99.91% | 1.0 s | 157 / 9 | 99.98% | 0.9 s |
+| s38584 | 36,303 | 1,504 / 2 | 100.00% | 1.5 s | 1,505 / 1 | 100.00% | 1.2 s |
+| b17 | 76,491 | 413 / 2,331 | 97.13% | 128 s | 744 / 1,819 | 97.76% | 169 s |
+| b19 | 533,276 | 1,526 / 6,525 | 98.87% | 562 s | 2,232 / 3,922 | 99.39% | 696 s |
+
+Over all circuits, aborted faults drop from 212 to 104 on ISCAS'85, 311 to 64 on ISCAS'89
+and 12,474 to 8,492 on ITC'99. The largest ITC'99 circuits take longer, mostly in learning.
 
 ## What is supported now
 
@@ -154,7 +161,7 @@ backtrack limit 1000, 4 threads:
 | Simulation | 64-pattern bit-parallel, full-scan view | |
 | Faults | Single stuck-at on stems and fanout branches; equivalence collapsing; faults in unobservable logic counted separately | Transition faults, dominance collapsing |
 | Fault simulation | Parallel-pattern single-fault propagation, event-driven, fault dropping, multi-threaded; checked against brute force | |
-| ATPG | Stuck-at, full scan: random phase, PODEM with SCOAP backtrace and X-path check, redundancy proofs, reverse-order compaction, plain-text patterns, decision trace | Learning (SOCRATES), SAT fallback, STIL patterns, transition faults, sequential ATPG |
+| ATPG | Stuck-at, full scan: random phase, PODEM with SCOAP backtrace and X-path check, SOCRATES static learning and unique sensitization, redundancy proofs, reverse-order compaction, plain-text patterns, decision trace | SAT fallback, FAN multiple backtrace, STIL patterns, transition faults, sequential ATPG |
 | Testability | SCOAP CC0/CC1/CO and COP probability/observability, full-scan view | |
 | Test points | Observe, control-0, control-1; greedy COP selection re-aimed by fault simulation; insertion with library cells, mission-mode check | ML-guided selection (Phase 3b), timing-aware placement of points |
 | Scan insertion | Mux-D scan on library cells; function-based scan cell matching; clock-domain and edge grouping; balanced chains; restitching existing scan cells; DEF SCANCHAINS, STIL, Tessent outputs; mission-mode and shift checks | Lockup latches for mixed-clock chains, test-mode control of gated clocks and async set/reset, LSSD and clocked scan, compression |
@@ -180,7 +187,7 @@ tests/          tests and test netlists (ISCAS c17, s27, Yosys-style sample)
 3. **Phase 2 (done):** scan insertion and stitching; DEF `SCANCHAINS`, STIL and Tessent outputs.
 4. **Phase 3:** test point insertion. 3a (done): the classic COP and fault-sim guided baseline.
    3b (deferred): a graph neural network trained on fault-simulation labels, measured against 3a.
-5. **Phase 4 (now):** ATPG. PODEM (done), then SOCRATES learning, SAT fallback, STIL patterns,
+5. **Phase 4 (now):** ATPG. PODEM (done), SOCRATES learning (done), then SAT fallback, STIL patterns,
    transition faults. Release v1.0.
 
 ## License

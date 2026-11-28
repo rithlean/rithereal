@@ -164,6 +164,8 @@ a 50k-gate random circuit (133k collapsed faults, 4,096 patterns) takes about 6 
 
 ## Layout
 
+How the code works, with block diagrams and a flowchart per module: [docs/](docs/README.md).
+
 ```
 include/rith/   public headers (netlist, eval, sim, io, design, liberty, fault, testability, scan, tpi, atpg)
 src/            library sources

@@ -116,8 +116,8 @@ flowchart TD
   A(["atpg"]) --> B["load netlist; print reader warnings"]
   B --> C{"--trace FAULT?"}
   C -->|yes| D["find the fault by its describe() name;<br/>Podem::generate with trace;<br/>print the steps"] --> Z0(["exit 0"])
-  C -->|no| E["AtpgConfig: --backtracks (1000), --random (4096),<br/>--seed, --no-compact"]
-  E --> F["run_atpg; print faults, detected, redundant, aborted,<br/>coverage, efficiency, patterns, time"]
+  C -->|no| E["AtpgConfig: --backtracks (1000), --random (4096),<br/>--seed, --no-compact, --plain,<br/>--sat-conflicts (10000), --no-sat"]
+  E --> F["run_atpg; print faults, detected, redundant, aborted,<br/>what SAT solved, coverage, efficiency, patterns, time"]
   F --> G["--show-aborted N lists aborted faults;<br/>-o writes the patterns"]
   G --> Z(["exit 0, or 1 if run_atpg reported an internal error"])
 ```

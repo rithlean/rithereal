@@ -51,13 +51,14 @@ flowchart TD
 | Design view | `design_roundtrip_keeps_cells_and_buses` | |
 | Scan insertion | `scan_cells_are_found_by_function`, `scan_insertion_dc_style`, `scan_insertion_clock_domains`, `scan_chain_count_and_balance`, `scan_checks_catch_a_broken_chain`, `scan_outputs` | `scan_domains.v`, `tiny.lib` |
 | Test point insertion | `tpi_cop_matches_the_inserted_logic`, `tpi_raises_random_pattern_coverage`, `tpi_skips_dead_logic`, `tpi_fixed_inputs_hold_their_value`, `tpi_design_insertion_keeps_mission_mode` | |
-| ATPG | `podem_matches_brute_force_on_benchmarks`, `podem_matches_brute_force_on_random_circuits`, `learned_implications_are_true`, `podem_decides_only_on_inputs_and_traces`, `atpg_flow_on_benchmarks` | `c17.bench`, `s27.bench`, 150 generated circuits |
+| ATPG | `podem_matches_brute_force_on_benchmarks`, `podem_matches_brute_force_on_random_circuits`, `learned_implications_are_true`, `podem_decides_only_on_inputs_and_traces`, `atpg_flow_on_benchmarks`, `sat_atpg_matches_brute_force` | `c17.bench`, `s27.bench`, 150 (300 for SAT) generated circuits |
+| SAT solver | `sat_solver_matches_brute_force` (3000 random formulas), `sat_solver_pigeonhole_is_unsat` | |
 
 Several tests compare a fast method with a slow, obviously correct one: the fault
 simulator against brute-force simulation of each fault, COP against exhaustive
 probability, collapsed faults against simulation of every member of the class, and
 the virtual COP with test points against COP of the netlist with the points really
-built, and PODEM against brute force over every input assignment.
+built, and PODEM and the SAT engine against brute force over every input assignment.
 
 ## CI (`.github/workflows/ci.yml`)
 

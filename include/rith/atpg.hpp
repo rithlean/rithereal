@@ -108,6 +108,20 @@ class Podem {
   std::shared_ptr<Impl> impl_;
 };
 
+// SAT-based test generation for one fault (Larrabee 1992, with TEGUS-style
+// active-path variables), using rith's own CDCL solver. Exact: Redundant is a
+// proof, Aborted only when the conflict limit is reached. backtracks holds the
+// solver's conflict count.
+class SatAtpg;
+class SatTestGenerator {
+ public:
+  explicit SatTestGenerator(const Netlist& nl);
+  PodemResult generate(const Fault& f, std::uint64_t conflict_limit = 0);
+
+ private:
+  std::shared_ptr<SatAtpg> impl_;
+};
+
 // ---- the whole flow ----
 struct AtpgConfig {
   std::size_t random_patterns = 4096;  // random phase first; 0 skips it
@@ -115,6 +129,7 @@ struct AtpgConfig {
   std::size_t backtrack_limit = 1000;
   bool compact = true;                 // reverse-order fault simulation drops useless patterns
   bool learning = true;                // SOCRATES-style learning and unique sensitization
+  std::uint64_t sat_conflicts = 10000; // SAT for faults PODEM aborts, per fault; 0 = no SAT
   std::uint64_t seed = 1;              // random phase and X fill
   unsigned threads = 0;                // fault simulation threads
 };
@@ -128,6 +143,7 @@ struct AtpgResult {
   std::size_t deterministic_patterns = 0;
   std::size_t backtracks = 0;
   std::size_t learned = 0;           // implications found by static learning
+  std::size_t sat_calls = 0, sat_detected = 0, sat_redundant = 0;  // the SAT stage
   std::vector<AtpgOutcome> status;   // per collapsed fault, after the run
   std::vector<std::string> errors;   // internal inconsistencies (should stay empty)
   FaultList fault_list;

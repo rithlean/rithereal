@@ -149,8 +149,9 @@ per fault, 4 threads:
 | b15 | 21,848 | n/a | 567 | 0 | 100.00% | 52 s |
 | b17 | 76,491 | 2,331 | 1,491 | 0 | 100.00% | 172 s |
 | b18 | 264,085 | n/a | 881 | 0 | 100.00% | 237 s |
+| b19 | 533,276 | 6,525 | 2,559 | 0 | 100.00% | 775 s |
 
-The "+ SOCRATES" column is what reached SAT, i.e. aborted by PODEM and not detected by a later pattern. Every ISCAS'85 and ISCAS'89 circuit and ITC'99 b01 to b18 now ends with no aborted fault.
+The "+ SOCRATES" column is what reached SAT, i.e. aborted by PODEM and not detected by a later pattern. Every ISCAS'85, ISCAS'89 and ITC'99 circuit now ends with no aborted fault.
 
 ## What is supported now
 

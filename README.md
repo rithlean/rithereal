@@ -34,7 +34,24 @@ build/rith testability tests/data/c17.bench --top 10              # hardest nets
 ```
 
 `equiv` is a random-simulation check in the full-scan view (flops cut, matched by
-name). It finds most real differences fast but is not a formal proof.
+name). It finds most real differences fast but is not a formal proof. To compare mission
+mode of two scanned netlists, or a scanned and an unscanned one, hold the scan enables off
+and leave out the scan ports:
+
+```sh
+build/rith --lib cells.lib equiv dc_scan.v rith_scan.v --tie SE=0 --ignore SI --ignore SO     --ignore test_si1 --ignore test_so1
+```
+
+### Existing scan chains
+
+```sh
+build/rith --lib cells.lib chains dc_scan.v --cells   # chains already in a DC/Genus netlist
+```
+
+Traces the chains by simulating shift mode, so it sees through buffers, inverters, lockup
+latches and DC's non-scan shift-register segments. On 19 DC-inserted SAED32 netlists (up to
+17,055 scan cells) the chain lengths match TetraMAX's DRC trace exactly. See
+[docs/modules/chains.md](docs/modules/chains.md).
 
 ### Scan insertion
 
@@ -155,7 +172,7 @@ and 12,474 to 8,492 on ITC'99. The largest ITC'99 circuits take longer, mostly i
 | Area | Supported | Not yet |
 | --- | --- | --- |
 | BENCH | ISCAS'85/'89 style, plus `MUX`, `CONST0`, `CONST1` | |
-| Verilog in | One flat module; gate primitives; Yosys generic cells (`$_AND_`, `$_MUX_`, `$_DFF_P_`, ...); Liberty-mapped cells from DC, Genus or a PDK (`--lib`), including scan flops, multi-output cells and either clock edge; `assign` of net, `~net` or constant; bus bits; escaped names; ANSI and non-ANSI headers; Yosys attributes skipped | Hierarchy, concatenations, latches, integrated clock gates; asynchronous set/reset is assumed inactive (with a warning) |
+| Verilog in | One flat module; gate primitives; Yosys generic cells (`$_AND_`, `$_MUX_`, `$_DFF_P_`, ...); Liberty-mapped cells from DC, Genus or a PDK (`--lib`), including scan flops, multi-output cells and either clock edge; `assign` of net, `~net` or constant; bus bits; escaped names; ANSI and non-ANSI headers; Yosys attributes skipped | Hierarchy, concatenations, functional latches (Liberty latches are modelled as transparent, as for lockup latches, with a warning), integrated clock gates; asynchronous set/reset is assumed inactive (with a warning) |
 | Verilog out | Flat structural Verilog with the original library cells, ports, buses and `assign`s (`rith scan`, `Design`); or generic primitives with `rith_dff` and `rith_mux2` (`convert`) | Hierarchy |
 | Core | Flat gate graph, CSR fanin/fanout, levelization, loop and driver checks | |
 | Simulation | 64-pattern bit-parallel, full-scan view | |

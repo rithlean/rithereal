@@ -31,30 +31,38 @@ std::size_t edit_distance(const std::string& a, const std::string& b) {
   return prev[b.size()];
 }
 
-// Output pin carrying the state: non-inverting preferred.
+// Output pin carrying the state. An output the instance already uses is
+// preferred, so stitching adds no new net (as Design Compiler does when only
+// QN is connected); then non-inverting before inverting.
 struct Tap {
   std::string pin;
   bool inverting = false;
 };
-std::optional<Tap> find_tap(const LibCell& c) {
+std::optional<Tap> find_tap(const LibCell& c, const std::vector<std::string>* used = nullptr) {
   if (!c.flop) return std::nullopt;
   std::vector<std::string> vars = input_pins(c);
   vars.push_back(kState);
-  std::optional<Tap> inv;
+  std::optional<Tap> best;
+  int best_rank = 4;
   for (const auto& p : c.pins) {
     if (p.dir != LibPin::Dir::Output) continue;
     const auto e = parse_opt(p.function);
     if (!e) continue;
     const LibFlop* ff = &*c.flop;
+    const bool in_use = used && std::find(used->begin(), used->end(), p.name) != used->end();
     try {
-      if (for_all(vars, {}, [&](const Env& env) { return eval(*e, ff, env) == env.at(kState); }))
-        return Tap{p.name, false};
-      if (!inv && for_all(vars, {}, [&](const Env& env) { return eval(*e, ff, env) != env.at(kState); }))
-        inv = Tap{p.name, true};
+      int rank = -1;
+      if (for_all(vars, {}, [&](const Env& env) { return eval(*e, ff, env) == env.at(kState); })) rank = in_use ? 0 : 2;
+      else if (for_all(vars, {}, [&](const Env& env) { return eval(*e, ff, env) != env.at(kState); }))
+        rank = in_use ? 1 : 3;
+      if (rank >= 0 && rank < best_rank) {
+        best_rank = rank;
+        best = Tap{p.name, rank % 2 == 1};
+      }
     } catch (const std::exception&) {
     }
   }
-  return inv;
+  return best;
 }
 
 }  // namespace
@@ -274,7 +282,7 @@ ScanResult insert_scan(Design& d, const Library& lib, const ScanConfig& cfg) {
       TypeInfo info;
       if (auto eq = find_scan_equivalent(lib, *lc, &used)) {
         info.eq = *eq;
-        if (auto tap = find_tap(*eq->cell)) info.tap = *tap;
+        if (auto tap = find_tap(*eq->cell, &used)) info.tap = *tap;
         else info.reason = "scan cell '" + eq->cell->name + "' has no output carrying its state";
       } else {
         info.reason = "no scan equivalent of cell '" + inst.type + "' in the library";
@@ -485,9 +493,11 @@ ScanCheck verify_mission_mode(const Elaboration& before, const Elaboration& afte
   for (std::size_t blk = 0; blk < blocks; ++blk) {
     for (auto& w : pa) w = rng();
     for (auto& w : sa) w = rng();
-    for (std::size_t i = 0; i < pa.size(); ++i)  // old scan enables stay off
-      if (auto it = r.old_scan_enables.find(a.gate(a.inputs()[i]).name); it != r.old_scan_enables.end())
-        pa[i] = it->second ? kAllOnes : 0;
+    for (std::size_t i = 0; i < pa.size(); ++i) {  // old scan enables stay off
+      const std::string& n = a.gate(a.inputs()[i]).name;
+      if (auto it = r.old_scan_enables.find(n); it != r.old_scan_enables.end()) pa[i] = it->second ? kAllOnes : 0;
+      else if (n == r.se_port) pa[i] = 0;  // a reused scan enable is off in both designs
+    }
     for (std::size_t i = 0; i < pb.size(); ++i) {
       const std::string& n = b.gate(b.inputs()[i]).name;
       if (n == r.se_port) pb[i] = 0;  // mission mode

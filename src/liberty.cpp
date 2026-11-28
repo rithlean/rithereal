@@ -206,6 +206,12 @@ LibCell make_cell(const Group& g) {
       f.preset = sub.attr("preset");
       cell.flop = f;
     } else if (sub.type == "latch") {
+      LibLatch l;
+      if (sub.args.size() >= 1) l.iq = sub.args[0];
+      if (sub.args.size() >= 2) l.iqn = sub.args[1];
+      l.data_in = sub.attr("data_in");
+      l.enable = sub.attr("enable");
+      cell.latch = l;
       cell.has_latch = true;
     } else if (sub.type == "statetable") {
       cell.has_statetable = true;

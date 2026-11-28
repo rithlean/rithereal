@@ -157,8 +157,10 @@ flowchart TD
   C -->|done| Z(["best match, or nothing"])
 ```
 
-`find_tap(cell)` picks the output pin whose function equals the state (Q), or, if
-none, one that equals NOT state (QN, marked inverting).
+`find_tap(cell, used)` picks the output pin that carries the state, preferring one the
+instance already uses, so stitching adds no new net: a used Q, then a used QN (marked
+inverting), then an unused Q, then an unused QN. This is what Design Compiler does when a
+flop only has QN connected, and it keeps flop names stable for `rith equiv`.
 
 ## Checking the result
 

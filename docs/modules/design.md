@@ -135,8 +135,8 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  A(["library_cell(cell, inst)"]) --> B{"latch or statetable?"}
-  B -->|yes| X1["ParseError: not supported yet (latches, clock gates)"]
+  A(["library_cell(cell, inst)"]) --> B{"statetable, or latch<br/>without data_in?"}
+  B -->|yes| X1["ParseError: not supported yet (clock gates)"]
   B -->|no| C{"every connected pin<br/>exists on the cell?"}
   C -->|no| X2["ParseError: cell has no pin ..."]
   C -->|yes| D{"cell has an ff group?"}
@@ -158,12 +158,13 @@ flowchart TD
   T -->|"0 / 1"| C["Const0 / Const1 gate"]
   T -->|"Var = IQ"| Q["the flop gate"]
   T -->|"Var = IQN"| QN["one shared Not of the flop"]
+  T -->|"Var = latch IQ / IQN"| LQ["build(data_in): the latch is transparent;<br/>IQN is one shared Not of it"]
   T -->|"Var = input pin"| V["the net connected to that pin<br/>(error if the pin is open)"]
   T -->|"Not of And / Or / Xor"| NN["one Nand / Nor / Xnor gate"]
   T -->|"Not of anything else"| N["Not gate"]
   T -->|"And / Or / Xor"| G["one gate with a fan-in per argument"]
   NN & N & G --> R["inputs come from build(arg) each;<br/>the gate is named 'out' if given,<br/>else a fresh 'inst/$k' net"]
-  V & Q & QN --> S{"out given?"}
+  V & Q & QN & LQ --> S{"out given?"}
   S -->|yes| B["add a Buf onto out"]
   S -->|no| U["use the net directly"]
 ```

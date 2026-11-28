@@ -56,5 +56,11 @@ flowchart TD
   M -->|no| N(["equivalent after blocks × 64 patterns"])
 ```
 
+`EquivalenceOptions` adds two things for comparing scanned netlists. `tie` holds an
+input at 0 or 1 in whichever netlist has it (for example `SE` off for mission mode);
+`ignore` names ports that may exist in only one netlist: such an input gets random
+values, and an output named there is not compared. A tied or ignored input may exist
+in only one netlist even if it has fan-out.
+
 This finds most real differences quickly, but it is a random check, not a formal
 proof. Flops are matched by name, so both netlists must use the same flop names.

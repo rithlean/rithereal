@@ -3,6 +3,8 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -24,10 +26,22 @@ struct EquivalenceResult {
   std::string mismatch;  // first differing output or flop, if any
 };
 
+struct EquivalenceOptions {
+  std::size_t blocks = 256;
+  std::uint64_t seed = 1;
+  // Inputs held at a constant in whichever netlist has them, for example a
+  // scan enable held off to compare mission mode: {"SE", false}.
+  std::map<std::string, bool> tie;
+  // Ports that may exist in only one netlist: such an input gets random
+  // values, such an output is not compared. Outputs named here are never compared.
+  std::set<std::string> ignore;
+};
+
 // Random-pattern equivalence check of two netlists in the full-scan view.
 // Inputs, outputs and flops are matched by name. An input present in only one
-// netlist is allowed if it has no fanout (for example a clock port).
-// Finds most real differences quickly but is not a formal proof.
+// netlist is allowed if it has no fanout (for example a clock port), is tied,
+// or is ignored. Finds most real differences quickly but is not a formal proof.
+EquivalenceResult compare_by_simulation(const Netlist& a, const Netlist& b, const EquivalenceOptions& opt);
 EquivalenceResult compare_by_simulation(const Netlist& a, const Netlist& b,
                                         std::size_t blocks = 256, std::uint64_t seed = 1);
 

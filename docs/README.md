@@ -18,6 +18,7 @@ Start with the architecture page, then open the module you want to read about.
 | [Faults and fault simulation](modules/fault.md) | The stuck-at fault list and the fault simulator | `include/rith/fault.hpp`, `src/fault.cpp` |
 | [Testability (SCOAP and COP)](modules/testability.md) | Scores that say how hard each net is to test | `include/rith/testability.hpp`, `src/testability.cpp` |
 | [Scan insertion](modules/scan.md) | Turning flops into scan flops and chaining them, plus the DEF/STIL/Tessent files | `include/rith/scan.hpp`, `src/scan.cpp`, `src/scan_out.cpp` |
+| [Tracing existing scan chains](modules/chains.md) | Finding the chains already in a DC or Genus netlist | `include/rith/chains.hpp`, `src/chains.cpp` |
 | [Test point insertion](modules/tpi.md) | Choosing and adding test points | `include/rith/tpi.hpp`, `src/tpi.cpp` |
 | [Test generation (ATPG)](modules/atpg.md) | PODEM test generation, redundancy proofs, compaction | `include/rith/atpg.hpp`, `src/atpg.cpp` |
 | [The `rith` command](modules/cli.md) | The command-line program that ties it together | `tools/rith_main.cpp` |

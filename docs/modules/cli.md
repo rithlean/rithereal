@@ -14,7 +14,8 @@ no DFT logic of its own.
 |---|---|---|
 | `stats <netlist>` | size, depth, gate mix | `read_netlist_file` |
 | `convert <in> <out>` | BENCH to Verilog or back | `read_netlist_file`, `write_netlist_file` |
-| `equiv <a> <b> [blocks]` | random equivalence check | `compare_by_simulation` |
+| `equiv <a> <b> [blocks] [--tie P=0\|1] [--ignore P]` | random equivalence check, optionally with inputs held constant (mission mode) and ports left out | `compare_by_simulation` |
+| `chains <netlist>` | trace the scan chains already in a netlist | `trace_scan_chains` |
 | `faultsim <netlist>` | random-pattern stuck-at coverage | `build_fault_list`, `FaultSimulator`, `run_random_patterns` |
 | `testability <netlist>` | hardest nets by SCOAP/COP | `compute_scoap`, `compute_cop` |
 | `scan <netlist.v> -o out.v` | scan insertion | `insert_scan`, `verify_mission_mode`, `verify_shift`, the writers |

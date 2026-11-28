@@ -11,7 +11,8 @@ reads only the **logic** part of it and skips timing and power:
 
 - each pin's name, direction, Boolean `function` and `signal_type` (scan pins);
 - the `ff` group of flip-flops (`next_state`, `clocked_on`, `clear`, `preset`);
-- whether a cell has a `latch` or `statetable` group (not supported yet);
+- a cell's `latch` group (state names, `data_in`, `enable`), and whether it has a
+  `statetable` group (not supported yet);
 - whether a cell is a scan cell (`test_cell` group or `test_scan_*` signal types).
 
 This lets the [Design elaborator](design.md) turn any library cell into primitive

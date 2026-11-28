@@ -27,6 +27,7 @@ flowchart TB
   end
 
   subgraph ANALYSIS["Analysis: measure the design"]
+    ATPG["Test generation: PODEM + flow<br/>atpg.hpp, atpg.cpp"]
     FAULT["Fault list and fault simulator<br/>fault.hpp, fault.cpp"]
     TEST["SCOAP and COP testability<br/>testability.hpp, testability.cpp"]
     SIM["Logic simulation and equivalence check<br/>sim.hpp, sim.cpp"]
@@ -158,6 +159,19 @@ flowchart TB
   ID --> WV["write_verilog_design"]
 ```
 
+### `rith atpg`
+
+```mermaid
+flowchart TB
+  F["netlist file"] --> L["load netlist"]
+  L --> T{"--trace FAULT?"}
+  T -->|yes| TR["Podem::generate with trace on;<br/>print each step"]
+  T -->|no| R["run_atpg: random phase,<br/>PODEM per undetected fault,<br/>reverse-order compaction"]
+  R --> P["print counts, coverage, efficiency"]
+  P --> O{"-o given?"}
+  O -->|yes| W["write_patterns"]
+```
+
 The normal full flow, as the README suggests, chains these commands:
 
 ```mermaid
@@ -185,6 +199,7 @@ flowchart BT
   testability["testability.hpp"] --> netlist
   scan["scan.hpp"] --> design & liberty
   tpi["tpi.hpp"] --> design & liberty & netlist
+  atpg["atpg.hpp"] --> fault & testability & netlist
   libfunc["src/libfunc.hpp"] --> liberty
 ```
 

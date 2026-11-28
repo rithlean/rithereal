@@ -274,10 +274,12 @@ struct Podem::Impl {
     auto add_obs = [&](GateId d) { if (!is_obs[d]) { is_obs[d] = 1; obs.push_back(d); } };
     for (const auto& [name, d] : nl.outputs()) add_obs(d);
     for (GateId ff : nl.flops()) add_obs(nl.fanins(ff)[0]);
+    // Values with every input and flop at X. Constants (tie-offs) are known
+    // here, so PODEM never takes them for decisions.
     base.assign(N, kX);
     for (GateId gid : nl.topo_order()) {
       const GateType t = nl.gate(gid).type;
-      if (is_source(t)) continue;
+      if (t == GateType::Input || t == GateType::Dff) continue;
       const auto fi = nl.fanins(gid);
       base[gid] = eval3(t, fi.size(), [&](std::size_t i) { return base[fi[i]]; });
     }
@@ -648,6 +650,8 @@ struct Podem::Impl {
       net = next;
       val = want;
     }
+    if (source_index[net] == SIZE_MAX)
+      throw std::logic_error("PODEM backtrace ended at " + nl.gate(net).name + ", which is not an input or flop");
     return {net, val};
   }
 

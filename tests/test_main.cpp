@@ -836,6 +836,12 @@ rith::Netlist small_random_netlist(std::size_t inputs, std::size_t gates, std::s
   for (std::size_t i = 0; i < inputs; ++i) { b << "INPUT(i" << i << ")\n"; names.push_back("i" + std::to_string(i)); }
   for (std::size_t i = 0; i < flops; ++i) names.push_back("q" + std::to_string(i));
   const char* types[] = {"AND", "NAND", "OR", "NOR", "XOR", "XNOR", "NOT", "BUFF", "MUX"};
+  // Tie-offs, as synthesis leaves them (1'b0 / 1'b1 pins).
+  if (seed % 3 == 0) {
+    b << "k0 = CONST0()\nk1 = CONST1()\n";
+    names.push_back("k0");
+    names.push_back("k1");
+  }
   for (std::size_t k = 0; k < gates; ++k) {
     const std::string t = types[rng() % 9];
     auto pick = [&] { return names[names.size() - 1 - rng() % std::min<std::size_t>(names.size(), 12)]; };

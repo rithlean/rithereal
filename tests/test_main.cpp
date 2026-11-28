@@ -12,6 +12,7 @@
 #include <random>
 
 #include "rith/atpg.hpp"
+#include "rith/chains.hpp"
 #include "rith/fault.hpp"
 #include "rith/design.hpp"
 #include "rith/io.hpp"
@@ -260,8 +261,6 @@ TEST(liberty_errors) {
     std::istringstream in(src);
     return rith::read_verilog(in, "<t>", &lib);
   };
-  CHECK_THROWS(with_lib("module m(input d, input g, output q); DLH_X1 l (.D(d), .G(g), .Q(q)); endmodule"),
-               "latch cell");
   CHECK_THROWS(with_lib("module m(input a, output y); NOR9_X1 u (.A(a), .ZN(y)); endmodule"),
                "not in the Liberty library");
   CHECK_THROWS(with_lib("module m(input a, output y); INV_X1 u (.X(a), .ZN(y)); endmodule"), "has no pin 'X'");
@@ -1025,4 +1024,98 @@ TEST(atpg_flow_on_benchmarks) {
   cfg.random_patterns = 0;
   const auto r = rith::run_atpg(red, cfg);
   CHECK(r.errors.empty() && r.redundant == 2 && r.aborted == 0 && r.efficiency() == 1.0 && r.coverage() < 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Netlists from other tools: lockup latches, existing chains, mission-mode equivalence
+// ---------------------------------------------------------------------------
+TEST(latch_is_transparent) {
+  const auto lib = tiny_lib();
+  std::istringstream in("module m(input d, input g, output q); DLH_X1 l (.D(d), .G(g), .Q(q)); endmodule");
+  const auto nl = rith::read_verilog(in, "<t>", &lib);
+  CHECK(nl.flops().empty());
+  CHECK(nl.warnings.size() == 1 && nl.warnings[0].find("transparent") != std::string::npos);
+  const std::vector<rith::Word> pi = {0x00ff00ff00ff00ffULL, 0x0f0f0f0f0f0f0f0fULL};
+  const auto v = rith::simulate(nl, pi, {});
+  const rith::Word d = pi[nl.inputs()[0] == nl.find("d") ? 0 : 1];
+  CHECK(v[nl.outputs()[0].second] == d);
+}
+
+TEST(scan_restitch_reusing_the_scan_enable) {
+  // Restitching an already scanned design into a different order, keeping
+  // its scan enable port: mission mode must hold that port off in both.
+  const auto lib = tiny_lib();
+  auto d = design_file("dc_style.v");
+  rith::insert_scan(d, lib);
+  const auto before = rith::elaborate(d, &lib);
+  rith::ScanConfig cfg;
+  cfg.chains = 2;
+  cfg.si_prefix = "si_b";
+  cfg.so_prefix = "so_b";
+  const auto r = rith::insert_scan(d, lib, cfg);  // reuses test_se
+  CHECK(r.restitched == 3);
+  const auto after = rith::elaborate(d, &lib);
+  const auto m = rith::verify_mission_mode(before, after, r);
+  CHECK(m.ok);
+  if (!m.ok) std::cerr << "  " << m.message << "\n";
+}
+
+TEST(scan_taps_the_output_already_in_use) {
+  // Only QN is connected: stitch through QN (inverted) rather than adding a net on Q.
+  const auto lib = tiny_lib();
+  auto d = design_str(
+      "module m(clk, a, y); input clk, a; output y; wire n1;\n"
+      "  DFF_X1 r ( .D(a), .CK(clk), .QN(n1) );\n  INV_X1 u ( .A(n1), .ZN(y) );\nendmodule\n");
+  const auto nets = d.net_count();
+  const auto r = rith::insert_scan(d, lib);
+  CHECK(r.chains.size() == 1 && r.chains[0].cells[0].out_pin == "QN" && r.chains[0].inverted());
+  CHECK(d.net_count() == nets + 3);  // test_se, test_si1, test_so1 only
+}
+
+TEST(trace_existing_chains) {
+  const auto lib = tiny_lib();
+  auto d = design_file("scan_domains.v");
+  {
+    rith::TraceConfig cfg;
+    cfg.se_port = "test_se";
+    CHECK_THROWS(rith::trace_scan_chains(rith::elaborate(d, &lib).netlist, cfg), "not an input");
+  }
+  const auto r = rith::insert_scan(d, lib);
+  const auto after = rith::elaborate(d, &lib);
+  rith::TraceConfig cfg;
+  cfg.se_port = r.se_port;
+  const auto t = rith::trace_scan_chains(after.netlist, cfg);
+  CHECK(t.chains.size() == r.chains.size() && t.broken.empty());
+  CHECK(t.off_chain.size() == 2);  // the gated-clock flop and the one with no scan version
+  for (const auto& want : r.chains) {
+    const rith::TracedChain* got = nullptr;
+    for (const auto& c : t.chains)
+      if (c.si_port == want.si_port) got = &c;
+    CHECK(got && got->so_port == want.so_port && got->cells.size() == want.cells.size());
+    if (!got || got->cells.size() != want.cells.size()) continue;
+    CHECK(got->so_inverted == want.inverted());
+    for (std::size_t i = 0; i < want.cells.size(); ++i)
+      CHECK(got->cells[i].flop == after.flop_of_instance[want.cells[i].instance]);
+  }
+  // With scan enable off no scan-in reaches a flop (functional shift paths, like a -> r1 -> r2, still show).
+  cfg.se_active_high = false;
+  for (const auto& c : rith::trace_scan_chains(after.netlist, cfg).chains) CHECK(c.si_port.rfind("test_si", 0) != 0);
+}
+
+TEST(equivalence_with_tied_and_ignored_ports) {
+  const auto lib = tiny_lib();
+  auto d = design_file("dc_style.v");
+  const auto before = rith::elaborate(d, &lib).netlist;
+  rith::insert_scan(d, lib);
+  const auto after = rith::elaborate(d, &lib).netlist;
+  CHECK_THROWS(rith::compare_by_simulation(before, after), "exists only in the second");
+  rith::EquivalenceOptions opt;
+  opt.ignore = {"test_si1", "test_so1"};
+  CHECK_THROWS(rith::compare_by_simulation(before, after, opt), "test_se");
+  opt.tie["test_se"] = true;  // shift mode: differs
+  CHECK(!rith::compare_by_simulation(before, after, opt).equivalent);
+  opt.tie["test_se"] = false;  // the old scan cell still shifts through se
+  CHECK(!rith::compare_by_simulation(before, after, opt).equivalent);
+  opt.tie["se"] = false;  // mission mode: the same
+  CHECK(rith::compare_by_simulation(before, after, opt).equivalent);
 }

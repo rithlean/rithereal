@@ -5,9 +5,11 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
+#include "rith/chains.hpp"
 #include "rith/design.hpp"
 #include "rith/io.hpp"
 #include "rith/scan.hpp"
@@ -25,7 +27,10 @@ constexpr const char* kUsage =
     "usage:\n"
     "  rith [--lib cells.lib ...] stats   <netlist>          print size, depth and gate mix\n"
     "  rith [--lib cells.lib ...] convert <in> <out>         convert between .bench and .v\n"
-    "  rith [--lib cells.lib ...] equiv   <a> <b> [blocks]   random-simulation equivalence (full-scan view)\n"
+    "  rith [--lib cells.lib ...] equiv   <a> <b> [blocks] [--tie PORT=0|1 ...] [--ignore PORT ...]\n"
+    "                                                      random-simulation equivalence (full-scan view)\n"
+    "  rith [--lib cells.lib ...] chains  <netlist> [--se SE] [--se-active auto|1|0] [--tie PORT=0|1 ...]\n"
+    "        [--cells] [--show-off N]                      trace the scan chains already in a netlist\n"
     "  rith [--lib cells.lib ...] faultsim <netlist> [--patterns N] [--seed S] [--show-undetected N]\n"
     "                                                      random-pattern stuck-at fault simulation\n"
     "  rith [--lib cells.lib ...] testability <netlist> [--top N]\n"
@@ -73,18 +78,6 @@ int convert(const std::string& in, const std::string& out) {
   rith::write_netlist_file(out, nl);
   std::cout << "wrote " << out << " (" << nl.size() << " gates)\n";
   return 0;
-}
-
-int equiv(const std::string& a, const std::string& b, std::size_t blocks) {
-  const auto na = load(a);
-  const auto nb = load(b);
-  const auto r = rith::compare_by_simulation(na, nb, blocks);
-  if (r.equivalent) {
-    std::cout << "no difference found in " << r.patterns << " random patterns\n";
-    return 0;
-  }
-  std::cout << "DIFFERENT: " << r.mismatch << " (after up to " << r.patterns << " patterns)\n";
-  return 1;
 }
 
 // Reads "--name value" options after the positional arguments.
@@ -177,6 +170,113 @@ void write_file(const std::string& path, F&& f) {
   std::cout << "wrote " << path << "\n";
 }
 
+bool ends_with(const std::string& s, const std::string& suffix) {
+  return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// All values of a repeatable "--name value" option.
+std::vector<std::string> all_options(const std::vector<std::string>& args, const std::string& name) {
+  std::vector<std::string> v;
+  for (std::size_t i = 0; i + 1 < args.size(); ++i)
+    if (args[i] == name) v.push_back(args[++i]);
+  return v;
+}
+
+// "--tie NAME=0|1", repeatable.
+std::map<std::string, bool> ties(const std::vector<std::string>& args) {
+  std::map<std::string, bool> t;
+  for (const auto& s : all_options(args, "--tie")) {
+    const auto eq = s.rfind('=');
+    if (eq == std::string::npos || eq == 0 || (s.substr(eq + 1) != "0" && s.substr(eq + 1) != "1"))
+      throw std::runtime_error("--tie expects NAME=0 or NAME=1, got '" + s + "'");
+    t[s.substr(0, eq)] = s[eq + 1] == '1';
+  }
+  return t;
+}
+
+int equiv(const std::vector<std::string>& args) {
+  const auto na = load(args[1]);
+  const auto nb = load(args[2]);
+  rith::EquivalenceOptions opt;
+  opt.blocks = args.size() > 3 && args[3].rfind("--", 0) != 0 ? std::stoull(args[3]) : option(args, "--blocks", 256);
+  opt.tie = ties(args);
+  for (const auto& n : all_options(args, "--ignore")) opt.ignore.insert(n);
+  const auto r = rith::compare_by_simulation(na, nb, opt);
+  if (r.equivalent) {
+    std::cout << "no difference found in " << r.patterns << " random patterns\n";
+    return 0;
+  }
+  std::cout << "DIFFERENT: " << r.mismatch << " (after up to " << r.patterns << " patterns)\n";
+  return 1;
+}
+
+int chains(const std::vector<std::string>& args) {
+  const std::string in = args[1];
+  rith::Netlist nl;
+  std::vector<std::string> inst_of;  // flop gate -> instance name, for mapped netlists
+  if (g_lib && (ends_with(in, ".v") || ends_with(in, ".vg") || ends_with(in, ".sv"))) {
+    const auto d = rith::read_verilog_design_file(in);
+    auto e = rith::elaborate(d, g_lib, in);
+    nl = std::move(e.netlist);
+    inst_of.resize(nl.size());
+    for (std::size_t i = 0; i < e.flop_of_instance.size(); ++i)
+      if (e.flop_of_instance[i] != rith::kNoGate) inst_of[e.flop_of_instance[i]] = d.instances[i].name;
+  } else {
+    nl = load(in);
+  }
+  for (const auto& w : nl.warnings) std::cerr << "warning: " << in << ": " << w << "\n";
+  auto cell_name = [&](rith::GateId f) {
+    return f < inst_of.size() && !inst_of[f].empty() ? inst_of[f] : nl.gate(f).name;
+  };
+
+  rith::TraceConfig cfg;
+  cfg.tie = ties(args);
+  std::string se = text_option(args, "--se", "");
+  if (se.empty())
+    for (const char* c : {"SE", "test_se", "scan_en", "scan_enable", "TE", "se"})
+      if (nl.find(c) != rith::kNoGate && nl.gate(nl.find(c)).type == rith::GateType::Input) {
+        se = c;
+        break;
+      }
+  if (se.empty()) throw std::runtime_error("no scan enable input found; name it with --se");
+  cfg.se_port = se;
+  const std::string pol = text_option(args, "--se-active", "auto");
+  rith::TraceResult r;
+  if (pol == "auto") {  // active high, else active low
+    r = rith::trace_scan_chains(nl, cfg);
+    if (r.chains.empty()) {
+      cfg.se_active_high = false;
+      auto low = rith::trace_scan_chains(nl, cfg);
+      if (!low.chains.empty()) r = std::move(low);
+      else cfg.se_active_high = true;
+    }
+  } else {
+    cfg.se_active_high = pol != "0" && pol != "low";
+    r = rith::trace_scan_chains(nl, cfg);
+  }
+
+  std::size_t on = 0, longest = 0;
+  for (const auto& c : r.chains) on += c.cells.size(), longest = std::max(longest, c.cells.size());
+  std::printf("design        %s (%zu flops)\n", nl.name.c_str(), nl.flops().size());
+  std::printf("scan enable   %s, active %s\n", se.c_str(), cfg.se_active_high ? "high" : "low");
+  std::printf("chains        %zu, longest %zu, %zu flops on chains, %zu off\n", r.chains.size(), longest, on,
+              r.off_chain.size());
+  const bool cells = flag(args, "--cells");
+  for (std::size_t i = 0; i < r.chains.size(); ++i) {
+    const auto& c = r.chains[i];
+    std::printf("  chain %-5zu %s -> %s, %zu cells%s\n", i + 1, c.si_port.c_str(), c.so_port.c_str(), c.cells.size(),
+                c.so_inverted ? ", inverting" : "");
+    if (cells)
+      for (const auto& x : c.cells) std::printf("    %s%s\n", cell_name(x.flop).c_str(), x.inverted ? " (inverted)" : "");
+  }
+  for (const auto& b : r.broken) std::printf("  broken      %s: its chain does not reach a scan-in input\n", b.c_str());
+  const std::size_t show = option(args, "--show-off", 10);
+  for (std::size_t i = 0; i < r.off_chain.size() && i < show; ++i)
+    std::printf("  off chain   %s\n", cell_name(r.off_chain[i]).c_str());
+  if (r.off_chain.size() > show) std::printf("  off chain   ... %zu more\n", r.off_chain.size() - show);
+  return r.chains.empty() ? 1 : 0;
+}
+
 int scan(const std::vector<std::string>& args) {
   if (!g_lib) throw std::runtime_error("scan needs the cell library: rith --lib cells.lib scan ...");
   const std::string in = args[1];
@@ -229,10 +329,6 @@ int scan(const std::vector<std::string>& args) {
   if (auto p = text_option(args, "--report", ""); !p.empty())
     write_file(p, [&](std::ostream& o) { rith::write_scan_report(o, d, r); });
   return status;
-}
-
-bool ends_with(const std::string& s, const std::string& suffix) {
-  return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 int tpi(const std::vector<std::string>& args) {
@@ -384,8 +480,8 @@ int main(int argc, char** argv) {
     if (!lib.cells.empty()) g_lib = &lib;
     if (args.size() == 2 && args[0] == "stats") return stats(args[1]);
     if (args.size() == 3 && args[0] == "convert") return convert(args[1], args[2]);
-    if ((args.size() == 3 || args.size() == 4) && args[0] == "equiv")
-      return equiv(args[1], args[2], args.size() == 4 ? std::stoul(args[3]) : 256);
+    if (args.size() >= 3 && args[0] == "equiv") return equiv(args);
+    if (args.size() >= 2 && args[0] == "chains") return chains(args);
     if (args.size() >= 2 && args[0] == "faultsim") return faultsim(args);
     if (args.size() >= 2 && args[0] == "testability") return testability(args);
     if (args.size() >= 2 && args[0] == "scan") return scan(args);

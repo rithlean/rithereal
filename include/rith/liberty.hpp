@@ -25,10 +25,18 @@ struct LibFlop {
   std::string clear, preset;  // asynchronous controls, empty when absent
 };
 
+// A level-sensitive latch. The logic view models it as transparent (Q follows
+// data_in), which is right for the lockup latches tools put in scan chains.
+struct LibLatch {
+  std::string iq, iqn;
+  std::string data_in, enable;
+};
+
 struct LibCell {
   std::string name;
   std::vector<LibPin> pins;
   std::optional<LibFlop> flop;
+  std::optional<LibLatch> latch;
   bool has_latch = false;      // latch group
   bool has_statetable = false; // statetable group (e.g. integrated clock gates)
   bool is_scan = false;        // has a test_cell group or scan signal_type pins

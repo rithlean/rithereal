@@ -498,6 +498,9 @@ class Elaborator {
     if (async_ignored_)
       nl_.warnings.push_back(std::to_string(async_ignored_) +
                              " flop(s) have asynchronous set/reset; they are assumed inactive in test mode");
+    if (latches_)
+      nl_.warnings.push_back(std::to_string(latches_) +
+                             " latch(es) modeled as transparent (output follows data_in), as for lockup latches");
     try {
       nl_.finalize();
     } catch (const NetlistError& e) {
@@ -591,7 +594,9 @@ class Elaborator {
   // Expands a Liberty cell instance into primitive gates.
   void library_cell(const LibCell& lc, const Instance& inst, std::size_t idx) {
     const std::string& name = inst.name;
-    if (lc.has_latch) fail("latch cell '" + lc.name + "' (instance '" + name + "') is not supported yet");
+    const LibLatch* latch = lc.latch ? &*lc.latch : nullptr;
+    if (lc.has_latch && (!latch || latch->data_in.empty() || latch->iq.empty()))
+      fail("latch cell '" + lc.name + "' (instance '" + name + "') has no data_in; not supported");
     if (lc.has_statetable)
       fail("cell '" + lc.name + "' (instance '" + name + "') uses a statetable (e.g. a clock gate); not supported yet");
     for (const auto& c : inst.conns)
@@ -607,6 +612,7 @@ class Elaborator {
     };
 
     GateId flop = kNoGate, flop_n = kNoGate;
+    GateId latch_q = kNoGate, latch_qn = kNoGate;  // a transparent latch's state, built on first use
     const LibFlop* ff = lc.flop ? &*lc.flop : nullptr;
     if (ff) {
       for (const auto& p : lc.pins)  // name the flop after the net its Q pin drives
@@ -616,6 +622,11 @@ class Elaborator {
         }
       if (flop == kNoGate) flop = nl_.get_or_declare(name + "/" + ff->iq);
     }
+
+    auto parse_fn = [&](const std::string& text) {
+      try { return parse_liberty_function(text); }
+      catch (const std::exception& ex) { fail("cell '" + lc.name + "': " + ex.what()); }
+    };
 
     std::function<GateId(const LibExpr&, GateId)> build = [&](const LibExpr& e, GateId out) -> GateId {
       auto place = [&](GateType t, std::vector<GateId> fi) {
@@ -628,7 +639,17 @@ class Elaborator {
         case LibExpr::Op::Const1: return place(GateType::Const1, {});
         case LibExpr::Op::Var: {
           GateId src;
-          if (ff && e.var == ff->iq) src = flop;
+          if (latch && (e.var == latch->iq || (!latch->iqn.empty() && e.var == latch->iqn))) {
+            if (latch_q == kNoGate) latch_q = build(parse_fn(latch->data_in), kNoGate);
+            if (e.var == latch->iq) src = latch_q;
+            else {
+              if (latch_qn == kNoGate) {
+                latch_qn = nl_.get_or_declare(name + "/" + latch->iqn);
+                drive(latch_qn, GateType::Not, {latch_q});
+              }
+              src = latch_qn;
+            }
+          } else if (ff && e.var == ff->iq) src = flop;
           else if (ff && !ff->iqn.empty() && e.var == ff->iqn) {
             if (flop_n == kNoGate) {
               flop_n = nl_.get_or_declare(name + "/" + ff->iqn);
@@ -667,11 +688,8 @@ class Elaborator {
       }
       return kNoGate;
     };
-    auto parse_fn = [&](const std::string& text) {
-      try { return parse_liberty_function(text); }
-      catch (const std::exception& ex) { fail("cell '" + lc.name + "': " + ex.what()); }
-    };
 
+    if (latch) ++latches_;
     if (ff) {
       if (ff->next_state.empty() || ff->clocked_on.empty())
         fail("flop cell '" + lc.name + "' lacks next_state or clocked_on");
@@ -708,6 +726,7 @@ class Elaborator {
   Netlist nl_;
   std::vector<GateId> flop_of_;
   std::size_t async_ignored_ = 0;
+  std::size_t latches_ = 0;
 };
 
 }  // namespace

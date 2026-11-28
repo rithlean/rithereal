@@ -19,7 +19,7 @@ Start with the architecture page, then open the module you want to read about.
 | [Testability (SCOAP and COP)](modules/testability.md) | Scores that say how hard each net is to test | `include/rith/testability.hpp`, `src/testability.cpp` |
 | [Scan insertion](modules/scan.md) | Turning flops into scan flops and chaining them, plus the DEF/STIL/Tessent files | `include/rith/scan.hpp`, `src/scan.cpp`, `src/scan_out.cpp` |
 | [Test point insertion](modules/tpi.md) | Choosing and adding test points | `include/rith/tpi.hpp`, `src/tpi.cpp` |
-| [Test generation (ATPG)](modules/atpg.md) | PODEM test generation, redundancy proofs, compaction | `include/rith/atpg.hpp`, `src/atpg.cpp` |
+| [Test generation (ATPG)](modules/atpg.md) | PODEM and SAT test generation, redundancy proofs, compaction | `include/rith/atpg.hpp`, `src/atpg.cpp`, `include/rith/sat.hpp`, `src/sat.cpp` |
 | [The `rith` command](modules/cli.md) | The command-line program that ties it together | `tools/rith_main.cpp` |
 | [Tests and CI](modules/tests.md) | How the code is checked | `tests/test_main.cpp`, `tests/data/`, `.github/workflows/ci.yml`, `CMakeLists.txt` |
 

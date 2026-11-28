@@ -11,11 +11,12 @@ input combination. **ATPG** (automatic test pattern generation) works out such a
 pattern for one target fault at a time, or proves that none exists. A fault with no
 test is **redundant**: the logic around it can never show the difference.
 
-The module has two parts:
+The module has three parts:
 
 1. `Podem`: generates a test for one fault with the PODEM algorithm.
-2. `run_atpg`: the whole flow for a netlist: random patterns, PODEM for what is left,
-   compaction.
+2. `SatTestGenerator`: the same job as a SAT problem, for the faults PODEM gives up on.
+3. `run_atpg`: the whole flow for a netlist: random patterns, PODEM for what is left,
+   SAT for what PODEM aborts, compaction.
 
 Everything works in the [full-scan view](../README.md#words-used-on-these-pages):
 inputs and flops are what the tester sets, outputs and flop D inputs are what it reads.
@@ -149,6 +150,41 @@ Learning and pruning must never lose a test. The tests run the brute-force
 comparison twice (plain and with learning), and check every learned implication
 against exhaustive simulation of c17, s27 and 150 random circuits.
 
+## SAT for the faults PODEM aborts (`SatTestGenerator`)
+
+PODEM with learning still gives up on some faults, mostly redundant ones inside XOR
+trees: proving there is no test needs reasoning that direct implications cannot do.
+For those, the question "is there an input assignment that detects this fault?" is
+written as a Boolean formula and handed to a SAT solver (Larrabee, 1992). The solver
+is rith's own (`include/rith/sat.hpp`), a small CDCL solver in the style of MiniSat:
+watched literals, learned clauses, VSIDS, restarts. No outside library is needed.
+
+```mermaid
+flowchart TD
+  F(["generate(fault, conflict limit)"]) --> C["fault cone: the fault gate and everything it feeds,<br/>up to outputs and flop inputs"]
+  C --> S["good support: everything feeding the cone or the fault site"]
+  S --> G["good machine: a variable per net in the support,<br/>clauses for each gate"]
+  S --> FM["faulty machine: a variable per net in the cone,<br/>the stuck value at the fault"]
+  G & FM --> E["excitation: good value at the site = NOT stuck"]
+  E --> P["path variables d: d at the fault gate;<br/>d(x) means good(x) differs from faulty(x),<br/>and passes on to a fanout unless x is observed"]
+  P --> R{"solve"}
+  R -->|satisfiable| T(["detected: the cube is the model's input values"])
+  R -->|unsatisfiable| RED(["redundant: a proof, not a give-up"])
+  R -->|conflict limit| AB(["aborted"])
+```
+
+Outside the cone the faulty machine equals the good one, so it needs no variables.
+The path variables are not needed for correctness, but they guide the solver along
+one route to an output and make it much faster (the "active path" idea of TEGUS).
+
+Gate clauses (Tseitin): AND, NAND, OR and NOR use the usual n+1 clauses; XOR and XNOR
+with more inputs become a chain of two-input XORs with helper variables; MUX uses six
+clauses.
+
+Only faults PODEM aborted reach SAT, with a limit of 10,000 conflicts each
+(`--sat-conflicts N`, `--no-sat` to skip). Each SAT pattern is fault-simulated like
+a PODEM pattern and must detect its fault.
+
 ## The whole flow (`run_atpg`)
 
 ```mermaid
@@ -158,13 +194,14 @@ flowchart TD
   R --> P["for each undetected fault: PODEM"]
   P --> Q{"outcome"}
   Q -->|redundant| MR["mark redundant"]
-  Q -->|aborted| MA["leave aborted"]
+  Q -->|aborted| MA["leave for SAT"]
   Q -->|detected| X["fill X with random bits; add to the block"]
   X --> BL{"64 patterns waiting?"}
   BL -->|yes| SIM["fault-simulate the block (drops other faults too);<br/>each target must be detected, else an internal error"]
   BL -->|no| P
   SIM --> P
-  P -->|done| C["reverse-order compaction: replay newest first,<br/>keep only patterns that detect something new"]
+  P -->|done| ST["SAT on each fault PODEM aborted and no pattern detected:<br/>redundant (proved), detected (pattern added), or still aborted"]
+  ST --> C["reverse-order compaction: replay newest first,<br/>keep only patterns that detect something new"]
   C --> Z(["AtpgResult: patterns, counts, status per fault, errors"])
 ```
 
@@ -189,12 +226,15 @@ backtrack) for one fault, for reading next to the paper.
 The [tests](tests.md) compare PODEM with brute force: on every fault of c17, s27 and
 150 random circuits with every gate type, PODEM with no backtrack limit must say
 detected exactly when some input assignment detects the fault, and its cube must
-detect it whatever the X bits are set to.
+detect it whatever the X bits are set to. The SAT engine gets the same check on
+300 random circuits, and the check was tried with four deliberate bugs in the
+encoding (no excitation, half of the difference clause, half of the MUX, no
+observation stop): each one makes it fail.
 
 ## Known limits
 
-- Some redundancies need more reasoning than SOCRATES's direct and learned
-  implications, mostly around XOR trees (c432, c499, c1355). A SAT fallback is
-  the planned next step.
+- A fault that is too hard for both PODEM and SAT within their limits stays aborted.
+- The SAT formula is built from scratch for each fault; incremental solving would be
+  faster on large designs.
 - PODEM runs on one thread; only fault simulation uses several.
 - Patterns are written as plain text; STIL patterns are planned.

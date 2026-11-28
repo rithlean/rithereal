@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "rith/eval.hpp"
+#include "rith/sat.hpp"
 
 namespace rith {
 
@@ -273,10 +274,12 @@ struct Podem::Impl {
     auto add_obs = [&](GateId d) { if (!is_obs[d]) { is_obs[d] = 1; obs.push_back(d); } };
     for (const auto& [name, d] : nl.outputs()) add_obs(d);
     for (GateId ff : nl.flops()) add_obs(nl.fanins(ff)[0]);
+    // Values with every input and flop at X. Constants (tie-offs) are known
+    // here, so PODEM never takes them for decisions.
     base.assign(N, kX);
     for (GateId gid : nl.topo_order()) {
       const GateType t = nl.gate(gid).type;
-      if (is_source(t)) continue;
+      if (t == GateType::Input || t == GateType::Dff) continue;
       const auto fi = nl.fanins(gid);
       base[gid] = eval3(t, fi.size(), [&](std::size_t i) { return base[fi[i]]; });
     }
@@ -647,6 +650,8 @@ struct Podem::Impl {
       net = next;
       val = want;
     }
+    if (source_index[net] == SIZE_MAX)
+      throw std::logic_error("PODEM backtrace ended at " + nl.gate(net).name + ", which is not an input or flop");
     return {net, val};
   }
 
@@ -730,6 +735,209 @@ std::vector<LearnedImplication> Podem::learned_implications() const {
 }
 
 PodemResult Podem::generate(const Fault& f, const PodemConfig& cfg) { return impl_->run(f, cfg); }
+
+
+// ---------------------------------------------------------------------------
+// SAT-based test generation (Larrabee, "Test pattern generation using Boolean
+// satisfiability", IEEE TCAD 1992), used for the faults PODEM aborts.
+//
+// Variables: the good value of every net in the fanin of the fault cone, and
+// the faulty value of every net in the cone (outside it the two are equal).
+// Each gate becomes its CNF (Tseitin). The fault site must hold the opposite of
+// the stuck value. Path variables d (active-path, as in TEGUS) say a net
+// differs between the machines and passes the difference on: d at the root,
+// and d at a net implies d at one of its fanouts, or the net is observed.
+class SatAtpg {
+ public:
+  explicit SatAtpg(const Netlist& nl) : nl_(nl), is_obs_(nl.size(), 0), in_cone_(nl.size(), 0), in_sup_(nl.size(), 0),
+                                        gv_(nl.size(), kNone), fv_(nl.size(), kNone), dv_(nl.size(), kNone) {
+    for (const auto& [name, d] : nl.outputs()) is_obs_[d] = 1;
+    for (GateId ff : nl.flops()) is_obs_[nl.fanins(ff)[0]] = 1;
+    source_index_.assign(nl.size(), SIZE_MAX);
+    std::size_t k = 0;
+    for (GateId i : nl.inputs()) source_index_[i] = k++;
+    for (GateId i : nl.flops()) source_index_[i] = k++;
+    width_ = k;
+  }
+
+  PodemResult generate(const Fault& flt, std::uint64_t conflict_limit) {
+    PodemResult r;
+    reset();
+    const std::uint8_t stuck = flt.stuck_at_one ? 1 : 0;
+    const GateId site = flt.pin < 0 ? flt.gate : nl_.fanins(flt.gate)[static_cast<std::size_t>(flt.pin)];
+    const bool dff_pin = flt.pin >= 0 && nl_.gate(flt.gate).type == GateType::Dff;
+    // Fault cone (where the faulty machine may differ).
+    if (!dff_pin) {
+      std::vector<GateId> st{flt.gate};
+      mark(in_cone_, cone_, flt.gate);
+      while (!st.empty()) {
+        const GateId h = st.back();
+        st.pop_back();
+        for (GateId o : nl_.fanouts(h))
+          if (!in_cone_[o] && !is_source(nl_.gate(o).type)) { mark(in_cone_, cone_, o); st.push_back(o); }
+      }
+    }
+    // Good-machine support: the fanin of the cone and of the site.
+    {
+      std::vector<GateId> st;
+      auto add = [&](GateId x) { if (!in_sup_[x]) { mark(in_sup_, sup_, x); st.push_back(x); } };
+      add(site);
+      for (GateId h : cone_) add(h);
+      while (!st.empty()) {
+        const GateId h = st.back();
+        st.pop_back();
+        if (is_source(nl_.gate(h).type)) continue;
+        for (GateId f : nl_.fanins(h)) add(f);
+      }
+    }
+    SatSolver s;
+    const std::uint32_t vtrue = s.new_var();
+    s.add_clause({sat_pos(vtrue)});
+    for (GateId x : sup_) gv_[x] = s.new_var();
+    for (GateId x : sup_) encode(s, x, [&](GateId f) { return sat_pos(gv_[f]); }, sat_pos(gv_[x]));
+    // Excitation.
+    s.add_clause({stuck ? sat_neg(gv_[site]) : sat_pos(gv_[site])});
+    if (!dff_pin) {
+      for (GateId x : cone_) fv_[x] = s.new_var();
+      const SatLit kStuck = stuck ? sat_pos(vtrue) : sat_neg(vtrue);
+      for (GateId x : cone_) {
+        if (flt.pin < 0 && x == flt.gate) {
+          s.add_clause({stuck ? sat_pos(fv_[x]) : sat_neg(fv_[x])});
+          continue;
+        }
+        if (is_source(nl_.gate(x).type)) continue;  // only the stem-fault source can be in the cone
+        const auto fi = nl_.fanins(x);
+        std::size_t pin = 0;
+        encode(s, x,
+               [&](GateId f) {
+                 const std::size_t i = pin++;
+                 if (flt.pin >= 0 && x == flt.gate && static_cast<std::size_t>(flt.pin) == i) return kStuck;
+                 return in_cone_[f] ? sat_pos(fv_[f]) : sat_pos(gv_[f]);
+               },
+               sat_pos(fv_[x]));
+        (void)fi;
+      }
+      // Active path.
+      for (GateId x : cone_) dv_[x] = s.new_var();
+      for (GateId x : cone_) {
+        const SatLit d = sat_pos(dv_[x]), g = sat_pos(gv_[x]), f = sat_pos(fv_[x]);
+        s.add_clause({sat_not(d), g, f});
+        s.add_clause({sat_not(d), sat_not(g), sat_not(f)});
+        if (is_obs_[x]) continue;
+        std::vector<SatLit> next{sat_not(d)};
+        for (GateId o : nl_.fanouts(x))
+          if (in_cone_[o] && !is_source(nl_.gate(o).type)) next.push_back(sat_pos(dv_[o]));
+        s.add_clause(next);
+      }
+      s.add_clause({sat_pos(dv_[flt.gate])});
+    }
+    const SatResult res = s.solve(conflict_limit);
+    r.backtracks = s.conflicts();
+    if (res == SatResult::Unsat) { r.outcome = AtpgOutcome::Redundant; return r; }
+    if (res == SatResult::Unknown) { r.outcome = AtpgOutcome::Aborted; return r; }
+    r.outcome = AtpgOutcome::Detected;
+    r.cube.assign(width_, -1);
+    for (GateId x : sup_)
+      if (source_index_[x] != SIZE_MAX) r.cube[source_index_[x]] = s.model_value(gv_[x]) ? 1 : 0;
+    return r;
+  }
+
+ private:
+  static constexpr std::uint32_t kNone = 0xFFFFFFFFu;
+  void mark(std::vector<char>& m, std::vector<GateId>& list, GateId x) { m[x] = 1; list.push_back(x); }
+  void reset() {
+    for (GateId x : cone_) { in_cone_[x] = 0; fv_[x] = dv_[x] = kNone; }
+    for (GateId x : sup_) { in_sup_[x] = 0; gv_[x] = kNone; }
+    cone_.clear();
+    sup_.clear();
+  }
+
+  // CNF of gate x with output literal y; in(f) gives the literal of fanin net f
+  // (called once per pin, in order).
+  template <class In>
+  void encode(SatSolver& s, GateId x, In&& in, SatLit y) {
+    const GateType t = nl_.gate(x).type;
+    const auto fi = nl_.fanins(x);
+    std::vector<SatLit> a;
+    if (!is_source(t))
+      for (GateId f : fi) a.push_back(in(f));
+    switch (t) {
+      case GateType::Input:
+      case GateType::Dff:
+      case GateType::Undefined: return;
+      case GateType::Const0: s.add_clause({sat_not(y)}); return;
+      case GateType::Const1: s.add_clause({y}); return;
+      case GateType::Buf:
+        s.add_clause({sat_not(y), a[0]});
+        s.add_clause({y, sat_not(a[0])});
+        return;
+      case GateType::Not:
+        s.add_clause({sat_not(y), sat_not(a[0])});
+        s.add_clause({y, a[0]});
+        return;
+      case GateType::And:
+      case GateType::Nand:
+      case GateType::Or:
+      case GateType::Nor: {
+        // Normalize to AND: OR(a) = NOT AND(NOT a).
+        const bool or_like = t == GateType::Or || t == GateType::Nor;
+        const bool inv = t == GateType::Nand || t == GateType::Or;  // output = NOT AND(core inputs)
+        const SatLit out = inv ? sat_not(y) : y;
+        std::vector<SatLit> big{out};
+        for (SatLit l : a) {
+          const SatLit li = or_like ? sat_not(l) : l;
+          s.add_clause({sat_not(out), li});
+          big.push_back(sat_not(li));
+        }
+        s.add_clause(big);
+        return;
+      }
+      case GateType::Xor:
+      case GateType::Xnor: {
+        SatLit acc = a[0];
+        for (std::size_t i = 1; i < a.size(); ++i) {
+          const SatLit z = (i + 1 == a.size()) ? (t == GateType::Xnor ? sat_not(y) : y) : sat_pos(s.new_var());
+          xor2(s, z, acc, a[i]);
+          acc = z;
+        }
+        if (a.size() == 1) {  // degenerate one-input XOR
+          const SatLit z = t == GateType::Xnor ? sat_not(y) : y;
+          s.add_clause({sat_not(z), acc});
+          s.add_clause({z, sat_not(acc)});
+        }
+        return;
+      }
+      case GateType::Mux2: {
+        const SatLit sel = a[0], d0 = a[1], d1 = a[2];
+        s.add_clause({sel, sat_not(d0), y});
+        s.add_clause({sel, d0, sat_not(y)});
+        s.add_clause({sat_not(sel), sat_not(d1), y});
+        s.add_clause({sat_not(sel), d1, sat_not(y)});
+        s.add_clause({sat_not(d0), sat_not(d1), y});
+        s.add_clause({d0, d1, sat_not(y)});
+        return;
+      }
+    }
+  }
+  static void xor2(SatSolver& s, SatLit z, SatLit p, SatLit q) {
+    s.add_clause({sat_not(z), p, q});
+    s.add_clause({sat_not(z), sat_not(p), sat_not(q)});
+    s.add_clause({z, sat_not(p), q});
+    s.add_clause({z, p, sat_not(q)});
+  }
+
+  const Netlist& nl_;
+  std::vector<char> is_obs_, in_cone_, in_sup_;
+  std::vector<std::uint32_t> gv_, fv_, dv_;
+  std::vector<GateId> cone_, sup_;
+  std::vector<std::size_t> source_index_;
+  std::size_t width_ = 0;
+};
+
+SatTestGenerator::SatTestGenerator(const Netlist& nl) : impl_(std::make_shared<SatAtpg>(nl)) {}
+PodemResult SatTestGenerator::generate(const Fault& f, std::uint64_t conflict_limit) {
+  return impl_->generate(f, conflict_limit);
+}
 
 // ---------------------------------------------------------------------------
 
@@ -835,11 +1043,34 @@ AtpgResult run_atpg(const Netlist& nl, const AtpgConfig& cfg) {
     if (pending.size() == 64) flush();
   }
   flush();
+  // 3. SAT for the faults PODEM aborted (and no pattern has detected since).
+  if (cfg.sat_conflicts) {
+    SatTestGenerator sat(nl);
+    for (std::size_t i = 0; i < nf; ++i) {
+      if (sim.status(i) == FaultStatus::Detected || res.status[i] == AtpgOutcome::Redundant) continue;
+      const auto r = sat.generate(fl.faults[i], cfg.sat_conflicts);
+      ++res.sat_calls;
+      if (r.outcome == AtpgOutcome::Redundant) {
+        res.status[i] = AtpgOutcome::Redundant;
+        ++res.sat_redundant;
+        continue;
+      }
+      if (r.outcome == AtpgOutcome::Aborted) continue;
+      ++res.sat_detected;
+      TestCube c = r.cube;
+      for (auto& v : c)
+        if (v < 0) v = static_cast<std::int8_t>(rng() & 1);
+      pending.push_back(std::move(c));
+      targets.push_back(i);
+      if (pending.size() == 64) flush();
+    }
+    flush();
+  }
   // Faults that a later pattern detected after PODEM gave up on them.
   for (std::size_t i = 0; i < nf; ++i)
     if (sim.status(i) == FaultStatus::Detected) res.status[i] = AtpgOutcome::Detected;
 
-  // 3. Reverse-order compaction: replay the patterns newest first and keep only
+  // 4. Reverse-order compaction: replay the patterns newest first and keep only
   // those that detect something new.
   if (cfg.compact && !patterns.empty()) {
     FaultSimulator again(nl, fl, cfg.threads);

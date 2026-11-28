@@ -15,6 +15,7 @@
 #include "rith/fault.hpp"
 #include "rith/design.hpp"
 #include "rith/io.hpp"
+#include "rith/sat.hpp"
 #include "rith/scan.hpp"
 #include "rith/sim.hpp"
 #include "rith/testability.hpp"
@@ -835,6 +836,12 @@ rith::Netlist small_random_netlist(std::size_t inputs, std::size_t gates, std::s
   for (std::size_t i = 0; i < inputs; ++i) { b << "INPUT(i" << i << ")\n"; names.push_back("i" + std::to_string(i)); }
   for (std::size_t i = 0; i < flops; ++i) names.push_back("q" + std::to_string(i));
   const char* types[] = {"AND", "NAND", "OR", "NOR", "XOR", "XNOR", "NOT", "BUFF", "MUX"};
+  // Tie-offs, as synthesis leaves them (1'b0 / 1'b1 pins).
+  if (seed % 3 == 0) {
+    b << "k0 = CONST0()\nk1 = CONST1()\n";
+    names.push_back("k0");
+    names.push_back("k1");
+  }
   for (std::size_t k = 0; k < gates; ++k) {
     const std::string t = types[rng() % 9];
     auto pick = [&] { return names[names.size() - 1 - rng() % std::min<std::size_t>(names.size(), 12)]; };
@@ -944,6 +951,32 @@ void check_learned_implications(const rith::Netlist& nl, const char* what) {
   }
 }
 
+// The SAT engine must give the same verdicts as brute force, and its cubes
+// must detect the fault.
+void check_sat_against_brute_force(const rith::Netlist& nl, const char* what) {
+  const auto fl = rith::build_fault_list(nl, false);
+  const auto testable = brute_force_testable(nl, fl);
+  rith::SatTestGenerator sat(nl);
+  for (std::size_t i = 0; i < fl.faults.size(); ++i) {
+    const auto r = sat.generate(fl.faults[i]);
+    const bool ok = testable[i] ? r.outcome == rith::AtpgOutcome::Detected : r.outcome == rith::AtpgOutcome::Redundant;
+    CHECK(ok);
+    if (!ok) {
+      std::cerr << "  " << what << ": " << rith::describe(nl, fl.faults[i]) << " is "
+                << (testable[i] ? "testable" : "untestable") << " but SAT says " << rith::to_string(r.outcome) << "\n";
+      return;
+    }
+    if (r.outcome == rith::AtpgOutcome::Detected) {
+      const bool d = cube_detects(nl, fl.faults[i], r.cube, 0);
+      CHECK(d);
+      if (!d) {
+        std::cerr << "  " << what << ": SAT cube for " << rith::describe(nl, fl.faults[i]) << " fails\n";
+        return;
+      }
+    }
+  }
+}
+
 }  // namespace
 
 TEST(podem_matches_brute_force_on_benchmarks) {
@@ -961,6 +994,19 @@ TEST(podem_matches_brute_force_on_random_circuits) {
     const std::string what = "random circuit seed " + std::to_string(seed);
     const int before = g_failures;
     check_podem_against_brute_force(nl, what.c_str());
+    if (g_failures != before) return;
+  }
+}
+
+TEST(sat_atpg_matches_brute_force) {
+  check_sat_against_brute_force(load("c17.bench"), "c17");
+  check_sat_against_brute_force(load("s27.bench"), "s27");
+  check_sat_against_brute_force(bench_str("INPUT(a)\nINPUT(b)\nOUTPUT(y)\nt = AND(a, b)\ny = OR(a, t)\n"), "redundant");
+  for (std::uint64_t seed = 1; seed <= 300; ++seed) {
+    const auto nl = small_random_netlist(4 + seed % 6, 20 + seed % 40, seed % 4, seed);
+    const std::string what = "random circuit seed " + std::to_string(seed);
+    const int before = g_failures;
+    check_sat_against_brute_force(nl, what.c_str());
     if (g_failures != before) return;
   }
 }
@@ -1025,4 +1071,77 @@ TEST(atpg_flow_on_benchmarks) {
   cfg.random_patterns = 0;
   const auto r = rith::run_atpg(red, cfg);
   CHECK(r.errors.empty() && r.redundant == 2 && r.aborted == 0 && r.efficiency() == 1.0 && r.coverage() < 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// SAT solver
+// ---------------------------------------------------------------------------
+TEST(sat_solver_matches_brute_force) {
+  std::mt19937_64 rng(42);
+  std::size_t sat = 0, unsat = 0;
+  for (int t = 0; t < 3000; ++t) {
+    const std::uint32_t nv = 3 + rng() % 12;
+    const std::size_t nc = nv * (2 + rng() % 4) + rng() % 5;
+    std::vector<std::vector<rith::SatLit>> cls;
+    for (std::size_t c = 0; c < nc; ++c) {
+      std::vector<rith::SatLit> cl;
+      const std::size_t len = 1 + rng() % 4;
+      for (std::size_t k = 0; k < len; ++k) cl.push_back(static_cast<rith::SatLit>(2 * (rng() % nv) + (rng() & 1)));
+      cls.push_back(cl);
+    }
+    auto holds = [&](std::uint64_t a) {
+      for (const auto& cl : cls) {
+        bool any = false;
+        for (auto l : cl) any |= ((a >> rith::sat_var(l) & 1) != 0) != ((l & 1) != 0);
+        if (!any) return false;
+      }
+      return true;
+    };
+    bool brute = false;
+    for (std::uint64_t a = 0; a < (std::uint64_t{1} << nv) && !brute; ++a) brute = holds(a);
+    rith::SatSolver s;
+    for (std::uint32_t v = 0; v < nv; ++v) s.new_var();
+    for (const auto& cl : cls) s.add_clause(cl);
+    const auto r = s.solve();
+    CHECK((r == rith::SatResult::Sat) == brute);
+    CHECK(r != rith::SatResult::Unknown);
+    if (r == rith::SatResult::Sat) {
+      std::uint64_t a = 0;
+      for (std::uint32_t v = 0; v < nv; ++v) a |= std::uint64_t{s.model_value(v)} << v;
+      CHECK(holds(a));
+      ++sat;
+    } else {
+      ++unsat;
+    }
+    if (g_failures) return;
+  }
+  CHECK(sat > 300 && unsat > 300);  // both answers are exercised
+}
+
+TEST(sat_solver_pigeonhole_is_unsat) {
+  // 7 pigeons in 6 holes: a classic hard UNSAT instance that needs real learning.
+  const int P = 7, H = 6;
+  rith::SatSolver s;
+  auto var = [&](int p, int h) { return static_cast<std::uint32_t>(p * H + h); };
+  for (int i = 0; i < P * H; ++i) s.new_var();
+  for (int p = 0; p < P; ++p) {
+    std::vector<rith::SatLit> cl;
+    for (int h = 0; h < H; ++h) cl.push_back(rith::sat_pos(var(p, h)));
+    s.add_clause(cl);
+  }
+  for (int h = 0; h < H; ++h)
+    for (int a = 0; a < P; ++a)
+      for (int b = a + 1; b < P; ++b) s.add_clause({rith::sat_neg(var(a, h)), rith::sat_neg(var(b, h))});
+  CHECK(s.solve() == rith::SatResult::Unsat);
+  rith::SatSolver t;  // with a tiny budget the answer is Unknown, not wrong
+  for (int i = 0; i < P * H; ++i) t.new_var();
+  for (int p = 0; p < P; ++p) {
+    std::vector<rith::SatLit> cl;
+    for (int h = 0; h < H; ++h) cl.push_back(rith::sat_pos(var(p, h)));
+    t.add_clause(cl);
+  }
+  for (int h = 0; h < H; ++h)
+    for (int a = 0; a < P; ++a)
+      for (int b = a + 1; b < P; ++b) t.add_clause({rith::sat_neg(var(a, h)), rith::sat_neg(var(b, h))});
+  CHECK(t.solve(5) == rith::SatResult::Unknown);
 }

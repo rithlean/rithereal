@@ -27,7 +27,7 @@ flowchart TB
   end
 
   subgraph ANALYSIS["Analysis: measure the design"]
-    ATPG["Test generation: PODEM + flow<br/>atpg.hpp, atpg.cpp"]
+    ATPG["Test generation: PODEM, SAT + flow<br/>atpg.hpp, atpg.cpp, sat.hpp, sat.cpp"]
     FAULT["Fault list and fault simulator<br/>fault.hpp, fault.cpp"]
     TEST["SCOAP and COP testability<br/>testability.hpp, testability.cpp"]
     SIM["Logic simulation and equivalence check<br/>sim.hpp, sim.cpp"]
@@ -166,7 +166,7 @@ flowchart TB
   F["netlist file"] --> L["load netlist"]
   L --> T{"--trace FAULT?"}
   T -->|yes| TR["Podem::generate with trace on;<br/>print each step"]
-  T -->|no| R["run_atpg: random phase,<br/>PODEM per undetected fault,<br/>reverse-order compaction"]
+  T -->|no| R["run_atpg: random phase,<br/>PODEM per undetected fault,<br/>SAT for what PODEM aborts,<br/>reverse-order compaction"]
   R --> P["print counts, coverage, efficiency"]
   P --> O{"-o given?"}
   O -->|yes| W["write_patterns"]
@@ -200,6 +200,7 @@ flowchart BT
   scan["scan.hpp"] --> design & liberty
   tpi["tpi.hpp"] --> design & liberty & netlist
   atpg["atpg.hpp"] --> fault & testability & netlist
+  atpgcpp["src/atpg.cpp"] --> sat["sat.hpp"]
   libfunc["src/libfunc.hpp"] --> liberty
 ```
 

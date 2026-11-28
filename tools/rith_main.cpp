@@ -38,8 +38,8 @@ constexpr const char* kUsage =
     "        [--observe-only | --control-only] [--cop-only] [-o out] [--enable tp_en] [--clock CK]\n"
     "                                                      test point insertion (greedy, COP + fault sim)\n"
     "  rith [--lib cells.lib ...] atpg <netlist> [--backtracks N] [--random N] [--seed S] [--no-compact] [--plain]\n"
-    "        [-o patterns.txt] [--show-aborted N] [--trace FAULT]\n"
-    "                                                      stuck-at test generation (random + PODEM)\n"
+    "        [--sat-conflicts N] [--no-sat] [-o patterns.txt] [--show-aborted N] [--trace FAULT]\n"
+    "                                                      stuck-at test generation (random + PODEM + SAT)\n"
     "\n"
     "Formats are chosen by extension: .bench, .v. Use --lib (repeatable) for netlists\n"
     "mapped to a cell library, such as Design Compiler or Genus output.\n";
@@ -338,6 +338,8 @@ int atpg(const std::vector<std::string>& args) {
   cfg.seed = option(args, "--seed", 1);
   cfg.compact = !flag(args, "--no-compact");
   cfg.learning = !flag(args, "--plain");
+  cfg.sat_conflicts = option(args, "--sat-conflicts", cfg.sat_conflicts);
+  if (flag(args, "--no-sat")) cfg.sat_conflicts = 0;
   const std::size_t show = option(args, "--show-aborted", 0);
   const auto t0 = std::chrono::steady_clock::now();
   const auto r = rith::run_atpg(nl, cfg);
@@ -347,10 +349,17 @@ int atpg(const std::vector<std::string>& args) {
   std::printf("faults        %zu collapsed, %zu uncollapsed\n", r.faults, r.uncollapsed);
   std::printf("detected      %zu\n", r.detected);
   std::printf("redundant     %zu (proved untestable)\n", r.redundant);
-  std::printf("aborted       %zu (backtrack limit %zu)\n", r.aborted, cfg.backtrack_limit);
+  if (cfg.sat_conflicts)
+    std::printf("aborted       %zu (backtrack limit %zu, then SAT with %llu conflicts)\n", r.aborted,
+                cfg.backtrack_limit, static_cast<unsigned long long>(cfg.sat_conflicts));
+  else
+    std::printf("aborted       %zu (backtrack limit %zu, no SAT)\n", r.aborted, cfg.backtrack_limit);
   std::printf("coverage      %.2f%% fault coverage, %.2f%% fault efficiency (uncollapsed)\n", 100 * r.coverage(),
               100 * r.efficiency());
-  std::printf("patterns      %zu (%zu random and %zu PODEM before compaction)\n", r.patterns.size(),
+  if (cfg.sat_conflicts)
+    std::printf("sat           %zu faults PODEM aborted: %zu detected, %zu proved redundant\n", r.sat_calls,
+                r.sat_detected, r.sat_redundant);
+  std::printf("patterns      %zu (%zu random and %zu PODEM/SAT before compaction)\n", r.patterns.size(),
               r.random_patterns_kept, r.deterministic_patterns);
   std::printf("backtracks    %zu\n", r.backtracks);
   std::printf("engine        %s\n", cfg.learning ? ("PODEM + SOCRATES learning (" + std::to_string(r.learned) +

@@ -24,7 +24,8 @@ add_library(rith_core
   src/file_io.cpp
   src/liberty.cpp
   src/fault.cpp
-  src/testability.cpp)
+  src/testability.cpp
+  src/atpg.cpp)
 target_include_directories(rith_core PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(rith_core PUBLIC Threads::Threads)

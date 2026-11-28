@@ -2,6 +2,7 @@
 #include <istream>
 #include <ostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "rith/io.hpp"
@@ -70,9 +71,14 @@ Netlist read_bench(std::istream& in, const std::string& filename) {
       throw ParseError(filename, lineno, e.what());
     }
   }
+  std::unordered_set<std::string> seen;
   for (const auto& [name, line] : outputs) {
     const GateId d = nl.find(name);
     if (d == kNoGate) throw ParseError(filename, line, "output '" + name + "' is never driven");
+    if (!seen.insert(name).second) {  // some ITC'99 files list an output twice
+      nl.warnings.push_back("line " + std::to_string(line) + ": output '" + name + "' listed again; ignored");
+      continue;
+    }
     nl.add_output(name, d);
   }
   nl.finalize();

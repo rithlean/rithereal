@@ -11,6 +11,7 @@
 #include <cmath>
 #include <random>
 
+#include "rith/atpg.hpp"
 #include "rith/fault.hpp"
 #include "rith/design.hpp"
 #include "rith/io.hpp"
@@ -153,6 +154,12 @@ TEST(yosys_generic_cells) {
   const auto r = rith::compare_by_simulation(nl, load("small_ref.bench"));
   CHECK(r.equivalent);
   if (!r.equivalent) std::cerr << "  " << r.mismatch << "\n";
+}
+
+TEST(bench_repeated_output_is_ignored) {
+  const auto nl = bench_str("INPUT(a)\nOUTPUT(y)\nOUTPUT(y)\ny = NOT(a)\n");
+  CHECK(nl.outputs().size() == 1);
+  CHECK(nl.warnings.size() == 1);
 }
 
 TEST(verilog_primitives_and_constants) {
@@ -813,4 +820,163 @@ TEST(tpi_design_insertion_keeps_mission_mode) {
   auto fresh = design_file("dc_style.v");
   const auto w = rith::insert_test_points(fresh, lib, {{"no_such_net", rith::TpKind::Observe}});
   CHECK(w.flops == 0 && w.warnings.size() == 1);
+}
+
+// ---------------------------------------------------------------------------
+// ATPG
+// ---------------------------------------------------------------------------
+namespace {
+
+// A small random circuit with every gate type, including MUX and XOR.
+rith::Netlist small_random_netlist(std::size_t inputs, std::size_t gates, std::size_t flops, std::uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::ostringstream b;
+  std::vector<std::string> names;
+  for (std::size_t i = 0; i < inputs; ++i) { b << "INPUT(i" << i << ")\n"; names.push_back("i" + std::to_string(i)); }
+  for (std::size_t i = 0; i < flops; ++i) names.push_back("q" + std::to_string(i));
+  const char* types[] = {"AND", "NAND", "OR", "NOR", "XOR", "XNOR", "NOT", "BUFF", "MUX"};
+  for (std::size_t k = 0; k < gates; ++k) {
+    const std::string t = types[rng() % 9];
+    auto pick = [&] { return names[names.size() - 1 - rng() % std::min<std::size_t>(names.size(), 12)]; };
+    b << "n" << k << " = " << t << "(" << pick();
+    const std::size_t extra = (t == "NOT" || t == "BUFF") ? 0 : t == "MUX" ? 2 : 1 + rng() % 2;
+    for (std::size_t e = 0; e < extra; ++e) b << ", " << pick();
+    b << ")\n";
+    names.push_back("n" + std::to_string(k));
+  }
+  for (std::size_t i = 0; i < flops; ++i) b << "q" << i << " = DFF(n" << gates / 2 + rng() % (gates / 2) << ")\n";
+  for (std::size_t k = gates - 4; k < gates; ++k) b << "OUTPUT(n" << k << ")\n";
+  return bench_str(b.str());
+}
+
+// Whether each uncollapsed fault is testable, by trying every source assignment.
+std::vector<bool> brute_force_testable(const rith::Netlist& nl, const rith::FaultList& fl) {
+  const std::size_t pis = nl.inputs().size(), nfl = nl.flops().size(), n = pis + nfl;
+  std::vector<bool> testable(fl.faults.size(), false);
+  rith::FaultSimulator sim(nl, fl, 1);
+  for (std::uint64_t base = 0; base < (std::uint64_t{1} << n); base += 64) {
+    std::vector<rith::Word> pi(pis, 0), st(nfl, 0);
+    for (std::uint64_t k = 0; k < 64 && base + k < (std::uint64_t{1} << n); ++k)
+      for (std::size_t i = 0; i < n; ++i)
+        if ((base + k) >> i & 1) (i < pis ? pi[i] : st[i - pis]) |= rith::Word{1} << k;
+    sim.simulate_block(pi, st, 0);  // valid = 0: compute good values, drop nothing
+    const std::uint64_t left = (std::uint64_t{1} << n) - base;
+    const rith::Word valid = left >= 64 ? rith::kAllOnes : (rith::Word{1} << left) - 1;
+    for (std::size_t i = 0; i < fl.faults.size(); ++i)
+      if (sim.detect_mask(fl.faults[i]) & valid) testable[i] = true;
+  }
+  return testable;
+}
+
+// Does this cube (X filled with `fill`) detect the fault?
+bool cube_detects(const rith::Netlist& nl, const rith::Fault& f, const rith::TestCube& c, std::uint64_t fill) {
+  const std::size_t pis = nl.inputs().size(), nfl = nl.flops().size();
+  std::vector<rith::Word> pi(pis, 0), st(nfl, 0);
+  for (std::size_t i = 0; i < c.size(); ++i) {
+    const bool v = c[i] < 0 ? (fill >> (i % 64) & 1) : c[i] == 1;
+    if (v) (i < pis ? pi[i] : st[i - pis]) = 1;
+  }
+  rith::FaultList one;
+  one.faults = {f};
+  one.weight = {1};
+  rith::FaultSimulator sim(nl, one, 1);
+  sim.simulate_block(pi, st, 0);
+  return sim.detect_mask(f) & 1;
+}
+
+void check_podem_against_brute_force(const rith::Netlist& nl, const char* what) {
+  const auto fl = rith::build_fault_list(nl, false);
+  const auto testable = brute_force_testable(nl, fl);
+  rith::Podem podem(nl);
+  rith::PodemConfig cfg;
+  cfg.backtrack_limit = 0;  // complete search: never abort
+  for (std::size_t i = 0; i < fl.faults.size(); ++i) {
+    const auto r = podem.generate(fl.faults[i], cfg);
+    const bool ok = testable[i] ? r.outcome == rith::AtpgOutcome::Detected : r.outcome == rith::AtpgOutcome::Redundant;
+    CHECK(ok);
+    if (!ok) {
+      std::cerr << "  " << what << ": " << rith::describe(nl, fl.faults[i]) << " is "
+                << (testable[i] ? "testable" : "untestable") << " but PODEM says " << rith::to_string(r.outcome)
+                << "\n";
+      return;
+    }
+    if (r.outcome == rith::AtpgOutcome::Detected) {
+      // Every X really is a don't care: any fill must detect the fault.
+      for (std::uint64_t fill : {std::uint64_t{0}, ~std::uint64_t{0}, std::uint64_t{0x5555555555555555}}) {
+        const bool d = cube_detects(nl, fl.faults[i], r.cube, fill);
+        CHECK(d);
+        if (!d) {
+          std::cerr << "  " << what << ": cube for " << rith::describe(nl, fl.faults[i]) << " fails\n";
+          return;
+        }
+      }
+    }
+  }
+}
+
+}  // namespace
+
+TEST(podem_matches_brute_force_on_benchmarks) {
+  check_podem_against_brute_force(load("c17.bench"), "c17");
+  check_podem_against_brute_force(load("s27.bench"), "s27");
+  // y = a OR (a AND b) has redundant faults.
+  check_podem_against_brute_force(bench_str("INPUT(a)\nINPUT(b)\nOUTPUT(y)\nt = AND(a, b)\ny = OR(a, t)\n"), "redundant");
+}
+
+TEST(podem_matches_brute_force_on_random_circuits) {
+  // Fuzzing: every gate type, reconvergence, flops. Any disagreement is a bug
+  // in PODEM or in the fault simulator.
+  for (std::uint64_t seed = 1; seed <= 150; ++seed) {
+    const auto nl = small_random_netlist(4 + seed % 6, 20 + seed % 40, seed % 4, seed);
+    const std::string what = "random circuit seed " + std::to_string(seed);
+    const int before = g_failures;
+    check_podem_against_brute_force(nl, what.c_str());
+    if (g_failures != before) return;
+  }
+}
+
+TEST(podem_decides_only_on_inputs_and_traces) {
+  const auto nl = load("c17.bench");
+  rith::Podem podem(nl);
+  rith::PodemConfig cfg;
+  cfg.trace = true;
+  const auto fl = rith::build_fault_list(nl, false);
+  for (const auto& f : fl.faults) {
+    const auto r = podem.generate(f, cfg);
+    CHECK(r.outcome == rith::AtpgOutcome::Detected);  // c17 has no redundant faults
+    CHECK(!r.trace.empty() && r.trace.front() == "fault " + rith::describe(nl, f) && r.trace.back() == "detected");
+    for (const auto& line : r.trace)
+      if (line.rfind("backtrace -> ", 0) == 0) {
+        const auto name = line.substr(13, line.find('=') - 13);
+        CHECK(nl.gate(nl.find(name)).type == rith::GateType::Input);
+      }
+    CHECK(r.cube.size() == nl.inputs().size());
+  }
+}
+
+TEST(atpg_flow_on_benchmarks) {
+  for (const char* f : {"c17.bench", "s27.bench"}) {
+    const auto nl = load(f);
+    const auto r = rith::run_atpg(nl);
+    CHECK(r.errors.empty());
+    CHECK(r.aborted == 0 && r.redundant == 0 && r.detected == r.faults);
+    CHECK(r.efficiency() == 1.0);
+    // Re-simulating the final pattern set independently detects every fault.
+    rith::FaultSimulator sim(nl, rith::build_fault_list(nl), 1);
+    const std::size_t pis = nl.inputs().size(), nfl = nl.flops().size();
+    std::vector<rith::Word> pi(pis, 0), st(nfl, 0);
+    CHECK(!r.patterns.empty() && r.patterns.size() <= 64);
+    for (std::size_t k = 0; k < r.patterns.size(); ++k)
+      for (std::size_t i = 0; i < pis + nfl; ++i)
+        if (r.patterns[k][i] == 1) (i < pis ? pi[i] : st[i - pis]) |= rith::Word{1} << k;
+    sim.simulate_block(pi, st, (rith::Word{1} << r.patterns.size()) - 1);
+    CHECK(sim.detected() == r.faults);
+  }
+  // With no random phase, PODEM alone must reach the same result, and the
+  // redundant faults of a OR (a AND b) are proved, not aborted.
+  const auto red = bench_str("INPUT(a)\nINPUT(b)\nOUTPUT(y)\nt = AND(a, b)\ny = OR(a, t)\n");
+  rith::AtpgConfig cfg;
+  cfg.random_patterns = 0;
+  const auto r = rith::run_atpg(red, cfg);
+  CHECK(r.errors.empty() && r.redundant == 2 && r.aborted == 0 && r.efficiency() == 1.0 && r.coverage() < 1.0);
 }
